@@ -77,6 +77,8 @@ pub struct AgentState {
     pub exec_in_progress: AtomicBool,
     /// Channel receiver for messages from the listener thread.
     msg_rx: Mutex<Option<mpsc::Receiver<AgentMessage>>>,
+    /// Serializes exec calls so concurrent requests queue instead of failing.
+    exec_lock: Mutex<()>,
 }
 
 impl AgentState {
@@ -88,6 +90,7 @@ impl AgentState {
             client_fd: Mutex::new(None),
             exec_in_progress: AtomicBool::new(false),
             msg_rx: Mutex::new(None),
+            exec_lock: Mutex::new(()),
         }
     }
 
@@ -102,6 +105,10 @@ impl AgentState {
     ///
     /// Returns (exit_code, stdout, stderr) on success.
     pub fn send_exec(&self, command: &str, args: &[String]) -> Result<(i32, String, String), String> {
+        // Serialize concurrent exec calls — only one can use the vsock channel at a time.
+        let _exec_guard = self.exec_lock.lock()
+            .map_err(|_| "Exec lock poisoned".to_string())?;
+
         let fd = self.client_fd.lock().unwrap()
             .ok_or_else(|| "Guest agent not connected".to_string())?;
 
