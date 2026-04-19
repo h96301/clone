@@ -4,6 +4,9 @@ A lightweight Linux VMM built for multi-tenant shell hosting and high-density VM
 
 Clone boots a template VM once, then forks isolated copies via Shadow Clone page mapping. Idle VMs get reclaimed automatically. A host running 100 shells uses memory like it's running 10.
 
+[![Watch the demo](demo.png)](https://www.youtube.com/watch?v=iWo9I2bjZkI)
+*[unixshells.com](https://unixshells.com) uses Clone as the VMM behind its shell hosting.*
+
 ```
 Template VM (4GB Ubuntu, all tools warm)
   ├── Fork → User shell 1  ─── ~160ms, full networking, unique IP
