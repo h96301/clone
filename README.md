@@ -94,15 +94,6 @@ clone fork --template /templates/python-ml
 # Execute function, destroy. Runtime was already warm.
 ```
 
-### AI/ML Inference
-
-Pass a GPU through via VFIO, fork a template with the model weights in memory. Every fork shares the weights via Shadow Clone — read-only pages are never duplicated.
-
-```bash
-sudo clone run --kernel vmlinuz --rootfs ml.img \
-  --passthrough 0000:01:00.0 --mem-mb 8192
-```
-
 ### Dev Environments
 
 Isolated Linux environment in <20ms with your code mounted in.
@@ -432,7 +423,6 @@ Clone is the VM engine. Your product is what you build on top.
 | **FaaS platform** | HTTP router → fork → execute → respond → destroy, request queuing, template pool per runtime |
 | **CI/CD runners** | Job scheduler, build script injection, artifact extraction, GitHub/GitLab webhook integration |
 | **Dev environments** | Workspace config (which template, which dirs to mount), IDE integration, persistent overlay management |
-| **ML inference** | Model loading into template, request batching, GPU scheduling across VMs, autoscaling |
 
 The pattern is always the same:
 
@@ -460,4 +450,4 @@ Needs work: MSI-X interrupt routing (stubbed), SR-IOV, vGPU/mdev, confidential V
 
 ## License
 
-Copyright (c) 2026 Unix Shells Limited Company. All rights reserved.
+MIT. Copyright (c) 2026 Unix Shells Limited Company.

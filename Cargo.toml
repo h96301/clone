@@ -3,7 +3,7 @@ name = "clone"
 version = "0.1.0"
 edition = "2021"
 description = "Minimal VMM for multi-tenant dev shells and serverless"
-license = "BUSL-1.1"
+license = "MIT"
 authors = ["Unix Shells Limited Company"]
 
 [dependencies]
