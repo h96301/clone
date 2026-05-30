@@ -18,6 +18,8 @@ mod rootfs_create;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
 
 #[derive(Parser)]
 #[command(name = "clone", about = "Minimal VMM for dev shells and serverless")]
@@ -45,9 +47,10 @@ enum Commands {
 
         /// Enable overlay mode for rootfs. The base image is mounted read-only
         /// and a writable layer is stacked on top.
-        /// Use without a value for tmpfs overlay (ephemeral), or specify a path
-        /// for a persistent overlay file.
-        #[arg(long, requires = "rootfs", default_missing_value = "tmpfs", num_args = 0..=1)]
+        /// - No value or "tmpfs": ephemeral tmpfs overlay (lost on shutdown)
+        /// - "auto": auto-create persistent overlay named by guest IP (e.g., overlay-172.30.0.2.img)
+        /// - A file path: use that file as persistent overlay (4GB ext4)
+        #[arg(long, requires = "rootfs", default_missing_value = "auto", num_args = 0..=1)]
         overlay: Option<String>,
 
         /// Kernel command line
@@ -61,6 +64,10 @@ enum Commands {
         /// Memory size in MB
         #[arg(long, default_value_t = 512)]
         mem_mb: u32,
+
+        /// Overlay disk size (e.g., "4G", "10G", "20G"). Default: 4G
+        #[arg(long)]
+        overlay_size: Option<String>,
 
         /// Number of vCPUs
         #[arg(long, default_value_t = 1)]
@@ -315,6 +322,33 @@ enum Commands {
         #[arg(long)]
         vm_id: String,
     },
+    /// Save a running VM to disk (memory + state), then shut it down
+    Save {
+        /// VM PID (auto-detected if only one VM running)
+        #[arg(long)]
+        vm_id: Option<u32>,
+        /// Output directory for the snapshot
+        #[arg(long)]
+        output: String,
+    },
+    /// Restore a previously saved VM from snapshot
+    Restore {
+        /// Path to snapshot directory
+        #[arg(long)]
+        snapshot: String,
+        /// Auto-configure networking (recreate bridge/TAP with same IP)
+        #[arg(long, conflicts_with = "tap")]
+        net: bool,
+        /// TAP device name
+        #[arg(long, conflicts_with = "net")]
+        tap: Option<String>,
+        /// Share a host directory via virtio-fs
+        #[arg(long)]
+        shared_dir: Option<String>,
+        /// Block device image (overrides snapshot metadata)
+        #[arg(long)]
+        block: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -386,6 +420,7 @@ fn main() -> Result<()> {
             jail,
             cid,
             kernel_manifest,
+            overlay_size,
         } => {
             #[cfg(target_os = "linux")]
             {
@@ -413,6 +448,9 @@ fn main() -> Result<()> {
                 };
                 let mut effective_initrd = initrd;
                 let mut rootfs_block: Option<String> = None;
+                let mut _overlay_auto = false;
+                let mut _rootfs_dir = ".".to_string();
+                let mut _resolved_overlay_path: Option<String> = None;
 
                 // Handle --rootfs mode: generate initrd and set up rootfs block device
                 let _initrd_data: Option<Vec<u8>>;
@@ -423,19 +461,14 @@ fn main() -> Result<()> {
                     // Determine effective overlay mode for the kernel cmdline.
                     // "tmpfs" → passed as-is (clone-init handles tmpfs overlay)
                     // "none" → no overlay
+                    // "auto" → defer until after network IP allocation
                     // any path → create/use overlay file, pass "block" to kernel
-                    let (overlay_mode, overlay_file) = if raw_overlay == "tmpfs" || raw_overlay == "none" {
-                        (raw_overlay.to_string(), None)
+                    let overlay_mode = if raw_overlay == "tmpfs" || raw_overlay == "none" || raw_overlay == "auto" {
+                        // "auto" will be resolved after network allocation below;
+                        // if no network, fall back to tmpfs
+                        if raw_overlay == "auto" { "tmpfs".to_string() } else { raw_overlay.to_string() }
                     } else {
-                        // Persistent overlay path — create file if needed
-                        let path = std::path::Path::new(raw_overlay);
-                        if !path.exists() {
-                            tracing::info!("Creating overlay file: {raw_overlay}");
-                            // Create a 1GB sparse file for overlay storage
-                            let f = std::fs::File::create(path)?;
-                            f.set_len(1024 * 1024 * 1024)?; // 1GB sparse
-                        }
-                        ("block".to_string(), Some(raw_overlay.to_string()))
+                        "block".to_string()
                     };
 
                     let readonly = overlay_mode != "none";
@@ -443,11 +476,22 @@ fn main() -> Result<()> {
                     let rootfs_config = rootfs::RootfsConfig {
                         image: rootfs_image.clone(),
                         readonly,
-                        overlay: overlay_mode.to_string(),
+                        overlay: overlay_mode.clone(),
                         fstype: "auto".to_string(),
                     };
 
-                    overlay_device = overlay_file;
+                    // Resolve overlay file path (deferred for "auto" — resolved after net setup)
+                    _resolved_overlay_path = if raw_overlay != "tmpfs" && raw_overlay != "none" && raw_overlay != "auto" {
+                        Some(raw_overlay.to_string())
+                    } else {
+                        None
+                    };
+                    // Store for later resolution
+                    _overlay_auto = raw_overlay == "auto";
+                    _rootfs_dir = std::path::Path::new(rootfs_image)
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| ".".to_string());
 
                     // Find clone-init binary and generate initrd
                     let init_binary = rootfs::find_init_binary()?;
@@ -488,19 +532,59 @@ fn main() -> Result<()> {
                 let primary_block = rootfs_block.or(block);
 
                 // Handle --net (auto-setup) vs --tap (manual)
-                let (effective_tap, pre_opened_tap_fd) = if net {
+                let (effective_tap, pre_opened_tap_fd, guest_ip) = if net {
                     match net::auto_setup_network(std::process::id()) {
-                        Ok((tap_name, tap_fd, _guest_ip)) => {
-                            (Some(tap_name), Some(tap_fd))
+                        Ok((tap_name, tap_fd, ip)) => {
+                            (Some(tap_name), Some(tap_fd), Some(ip))
                         }
                         Err(e) => {
                             tracing::warn!("Auto network setup failed: {e}");
-                            (None, None)
+                            (None, None, None)
                         }
                     }
                 } else {
-                    (tap, None)
+                    (tap, None, None)
                 };
+
+                // Parse overlay size (default 4G)
+                let overlay_bytes: u64 = overlay_size.as_deref()
+                    .map(parse_size)
+                    .unwrap_or(4 * 1024 * 1024 * 1024);
+
+                // Resolve auto overlay: use guest IP to name the file
+                if _overlay_auto {
+                    if let Some(ip) = guest_ip {
+                        let overlay_name = format!("overlay-{}.{}.{}.{}.img", ip[0], ip[1], ip[2], ip[3]);
+                        let overlay_path = format!("{}/{}", _rootfs_dir, overlay_name);
+                        let path = std::path::Path::new(&overlay_path);
+                        if !path.exists() {
+                            tracing::info!("Creating overlay file: {overlay_path} ({}GB)", overlay_bytes >> 30);
+                            let f = std::fs::File::create(&overlay_path)?;
+                            unsafe {
+                                libc::fallocate(f.as_raw_fd(), 0, 0, overlay_bytes as i64);
+                            }
+                            let _ = std::process::Command::new("mkfs.ext4")
+                                .args(["-q", "-F", &overlay_path])
+                                .status();
+                        }
+                        overlay_device = Some(overlay_path);
+                        // Patch cmdline: replace tmpfs with block overlay
+                        cmdline = cmdline.replace("clone.overlay=tmpfs", "clone.overlay=block");
+                    }
+                } else if let Some(ref p) = _resolved_overlay_path {
+                    let path = std::path::Path::new(p);
+                    if !path.exists() {
+                        tracing::info!("Creating overlay file: {p} ({}GB)", overlay_bytes >> 30);
+                        let f = std::fs::File::create(p)?;
+                        unsafe {
+                            libc::fallocate(f.as_raw_fd(), 0, 0, overlay_bytes as i64);
+                        }
+                        let _ = std::process::Command::new("mkfs.ext4")
+                            .args(["-q", "-F", p])
+                            .status();
+                    }
+                    overlay_device = Some(p.clone());
+                }
 
                 tracing::info!("Booting VM: kernel={kernel}, mem={mem_mb}MB, vcpus={vcpus}");
                 // If passthrough devices are present, remove pci=off from cmdline
@@ -523,7 +607,7 @@ fn main() -> Result<()> {
                     jail,
                     cid,
                     tap_fd: pre_opened_tap_fd,
-                    guest_ip: None,
+                    guest_ip,
                 };
                 let mut vm = vmm::Vm::new(config)?;
                 vm.boot()?;
@@ -957,7 +1041,7 @@ fn main() -> Result<()> {
 
             // Main thread: stdin -> socket (watch for Ctrl-Q = 0x11)
             {
-                use std::io::Read;
+                use std::io::{Read, Write};
                 let mut stream = stream;
                 let stdin = std::io::stdin();
                 let mut handle = stdin.lock();
@@ -967,7 +1051,12 @@ fn main() -> Result<()> {
                         // Ctrl-Q: detach
                         break;
                     }
-                    let _ = std::io::Write::write_all(&mut stream, &buf);
+                    // Local echo for better UX
+                    if buf[0] != b'\r' && buf[0] != b'\n' {
+                        let _ = std::io::stdout().write_all(&buf);
+                        let _ = std::io::stdout().flush();
+                    }
+                    let _ = stream.write_all(&buf);
                 }
             }
 
@@ -1032,6 +1121,86 @@ fn main() -> Result<()> {
                 Ok::<(), anyhow::Error>(())
             })?;
         }
+        Commands::Save { vm_id, output } => {
+            let pid = resolve_vm_pid(vm_id)?;
+            let socket_path = format!("/tmp/clone-{pid}.sock");
+
+            eprintln!("Saving VM (pid={pid}) to {output}...");
+
+            // Step 1: Snapshot (pauses VM, saves state, resumes VM)
+            let request = control::protocol::Request::Snapshot {
+                vm_id: pid.to_string(),
+                output_path: output.clone(),
+            };
+            let response = send_control_request(&socket_path, &request)?;
+            match response {
+                control::protocol::Response::Ok { body } => {
+                    if let control::protocol::ResponseBody::SnapshotComplete { path } = body {
+                        eprintln!("Snapshot saved: {path}");
+                    }
+                }
+                control::protocol::Response::Error { message } => {
+                    anyhow::bail!("Snapshot failed: {message}");
+                }
+            }
+
+            // Step 2: Shut down the VM
+            eprintln!("Shutting down VM (pid={pid})...");
+            let shutdown_req = control::protocol::Request::Shutdown;
+            match send_control_request(&socket_path, &shutdown_req) {
+                Ok(_) => eprintln!("VM shut down."),
+                Err(e) => {
+                    // Socket may be gone if VM exited during snapshot; that's fine.
+                    eprintln!("Note: could not send shutdown (VM may have exited): {e}");
+                }
+            }
+
+            eprintln!("VM saved to {output}. Restore with: clone restore --snapshot {output} --net");
+        }
+        Commands::Restore { snapshot, net, tap, shared_dir, block } => {
+            #[cfg(target_os = "linux")]
+            {
+                // Auto-configure networking if requested
+                let (effective_tap, pre_opened_tap_fd, guest_ip) = if net {
+                    match net::auto_setup_network(std::process::id()) {
+                        Ok((tap_name, tap_fd, ip)) => (Some(tap_name), Some(tap_fd), Some(ip)),
+                        Err(e) => {
+                            tracing::warn!("Auto network setup failed: {e}");
+                            (None, None, None)
+                        }
+                    }
+                } else {
+                    (tap, None, None)
+                };
+
+                tracing::info!("Restoring VM from snapshot: {snapshot}");
+                let config = vmm::VmConfig {
+                    kernel_path: String::new(),
+                    initrd_path: None,
+                    cmdline: String::new(),
+                    mem_mb: 0,
+                    vcpus: 0,
+                    block_device: block,
+                    overlay_device: None,
+                    tap_device: effective_tap,
+                    shared_dir,
+                    passthrough_devices: Vec::new(),
+                    seccomp: false,
+                    jail: None,
+                    cid: None,
+                    tap_fd: pre_opened_tap_fd,
+                    guest_ip,
+                };
+                let mut vm = vmm::Vm::new(config)?;
+                vm.restore_boot(&snapshot)?;
+                vm.run()?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (snapshot, net, tap, shared_dir, block);
+                anyhow::bail!("Clone requires Linux with KVM support.");
+            }
+        }
         Commands::MigrateRecv { port, kernel, mem_mb } => {
             #[cfg(target_os = "linux")]
             {
@@ -1073,6 +1242,21 @@ fn main() -> Result<()> {
 }
 
 /// Resolve the VM PID: use the given value, or auto-detect if only one
+/// Parse human-readable size string (e.g., "4G", "10G", "512M") to bytes.
+fn parse_size(s: &str) -> u64 {
+    let s = s.trim();
+    let (num_part, multiplier) = if s.ends_with('G') || s.ends_with('g') {
+        (&s[..s.len()-1], 1024u64 * 1024 * 1024)
+    } else if s.ends_with('M') || s.ends_with('m') {
+        (&s[..s.len()-1], 1024u64 * 1024)
+    } else if s.ends_with('K') || s.ends_with('k') {
+        (&s[..s.len()-1], 1024u64)
+    } else {
+        (s, 1u64)
+    };
+    num_part.parse::<u64>().unwrap_or(4) * multiplier
+}
+
 /// clone control socket exists in /tmp.
 fn resolve_vm_pid(vm_id: Option<u32>) -> Result<u32> {
     if let Some(pid) = vm_id {

@@ -133,6 +133,8 @@ fn embed_kernel_modules(cpio: &mut Vec<u8>) {
         ("kernel/net/vmw_vsock", "vmw_vsock_virtio_transport.ko"),
         // overlayfs (needed for --overlay mode)
         ("kernel/fs/overlayfs", "overlay.ko"),
+        // virtiofs (needed for --shared-dir)
+        ("kernel/fs/fuse", "virtiofs.ko"),
     ];
 
     // Create /lib/modules directory in initrd

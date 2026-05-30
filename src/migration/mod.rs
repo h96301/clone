@@ -681,6 +681,8 @@ pub fn run_receiver(
         vm_fd: Some(Arc::clone(&vm_fd)),
         agent_state: None,
         block_device: None,
+        overlay_path: None,
+        guest_ip: None,
     });
 
     match crate::control::sync_server::start_control_socket(Arc::clone(&vm_handle)) {

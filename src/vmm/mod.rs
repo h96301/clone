@@ -223,6 +223,7 @@ impl Vm {
 
         // 5. Register virtio devices with the MMIO bus
         let mut virtio_cmdline_params = Vec::new();
+        let mut shared_dir_mountpoint: Option<String> = None;
 
         {
             let mut mmio_bus = self.mmio_bus.lock().unwrap();
@@ -294,14 +295,14 @@ impl Vm {
             }
 
             // Register virtio-fs if a shared directory was provided
+            // Format: "/host/path:tag" or "/host/path:tag:/guest/mount" or just "/host/path"
             if let Some(ref shared_dir_spec) = self.config.shared_dir {
-                // Format: "/host/path:tag" or just "/host/path" (tag defaults to "fs0")
-                let (dir_path, tag) = if let Some(colon_pos) = shared_dir_spec.rfind(':') {
-                    let path = &shared_dir_spec[..colon_pos];
-                    let tag = &shared_dir_spec[colon_pos + 1..];
-                    (path.to_string(), tag.to_string())
-                } else {
-                    (shared_dir_spec.clone(), "fs0".to_string())
+                let parts: Vec<&str> = shared_dir_spec.splitn(3, ':').collect();
+                let (dir_path, tag, guest_mount) = match parts.len() {
+                    1 => (parts[0].to_string(), "fs0".to_string(), None),
+                    2 => (parts[0].to_string(), parts[1].to_string(), None),
+                    3 => (parts[0].to_string(), parts[1].to_string(), Some(parts[2].to_string())),
+                    _ => unreachable!(),
                 };
 
                 let root_dir = std::path::PathBuf::from(&dir_path);
@@ -313,6 +314,10 @@ impl Vm {
                         MMIO_STRIDE, base, irq
                     ));
                     tracing::info!("virtio-fs registered: dir={dir_path}, tag={tag}");
+                    if let Some(ref mnt) = guest_mount {
+                        shared_dir_mountpoint = Some(format!("clone.shared_dir={tag}:{mnt}"));
+                        tracing::info!("virtio-fs auto-mount: tag={tag} -> {mnt}");
+                    }
                 } else {
                     tracing::warn!("Shared directory does not exist: {dir_path}");
                 }
@@ -370,21 +375,25 @@ impl Vm {
         }
 
         // Append guest networking params if TAP is configured but no net params present.
-        // The daemon adds these via its dispatch, but direct `clone run --net` doesn't.
         if self.config.tap_device.is_some() && !cmdline.contains("clone.net_ip=") {
-            let vsock_cid = self.config.cid.unwrap_or(3);
-            let vm_index = vsock_cid - 3;
-            let host_part = 2 + vm_index;
-            let guest_ip = format!("172.30.{}.{}", host_part / 256, host_part % 256);
-            cmdline.push_str(&format!(
-                " clone.net_ip={} clone.net_gw=172.30.0.1 clone.net_mask=16",
-                guest_ip
-            ));
+            if let Some(ip) = self.config.guest_ip {
+                let guest_ip_str = format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]);
+                let gateway = crate::net::DEFAULT_BRIDGE_IP;
+                cmdline.push_str(&format!(
+                    " clone.net_ip={guest_ip_str} clone.net_gw={gateway} clone.net_mask=255.255.0.0"
+                ));
+            }
         }
 
         for param in &virtio_cmdline_params {
             cmdline.push(' ');
             cmdline.push_str(param);
+        }
+
+        // Pass shared-dir mount info so clone-init can auto-mount
+        if let Some(ref shared_dir_param) = shared_dir_mountpoint {
+            cmdline.push(' ');
+            cmdline.push_str(shared_dir_param);
         }
 
         // 5b. Set up PCI bus and VFIO passthrough devices
@@ -654,12 +663,12 @@ impl Vm {
             // Register virtio-fs BEFORE net (matching clone run order).
             // Template device order: [balloon(0), vsock(1), block(2), fs(3), net(4)]
             if let Some(ref shared_dir_spec) = self.config.shared_dir {
-                let (dir_path, tag) = if let Some(colon_pos) = shared_dir_spec.rfind(':') {
-                    let path = &shared_dir_spec[..colon_pos];
-                    let tag = &shared_dir_spec[colon_pos + 1..];
-                    (path.to_string(), tag.to_string())
-                } else {
-                    (shared_dir_spec.clone(), "fs0".to_string())
+                let parts: Vec<&str> = shared_dir_spec.splitn(3, ':').collect();
+                let (dir_path, tag) = match parts.len() {
+                    1 => (parts[0].to_string(), "fs0".to_string()),
+                    2 => (parts[0].to_string(), parts[1].to_string()),
+                    3 => (parts[0].to_string(), parts[1].to_string()),
+                    _ => unreachable!(),
                 };
                 let root_dir = std::path::PathBuf::from(&dir_path);
                 if root_dir.is_dir() {
@@ -814,6 +823,269 @@ impl Vm {
             num_vcpus,
         );
 
+        Ok(())
+    }
+
+    /// Restore a VM from a previously saved snapshot.
+    ///
+    /// Unlike `fork_boot()` which uses CoW mmap for template sharing,
+    /// this uses a private copy of the saved memory so the VM can
+    /// freely modify it. Overlay disk and guest IP are preserved.
+    pub fn restore_boot(&mut self, snapshot_dir: &str) -> Result<()> {
+        use crate::boot::template::TemplateSnapshot;
+        use crate::boot::identity;
+
+        let template = TemplateSnapshot::load(snapshot_dir, true)?;
+        let mem_size = template.memory_size;
+
+        // 1. mmap saved memory as MAP_PRIVATE (read-write copy, not CoW shared)
+        let mem_file = std::fs::File::open(&template.memory_file)
+            .with_context(|| format!("Failed to open snapshot memory: {}", template.memory_file.display()))?;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mem_size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE,
+                mem_file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            anyhow::bail!("mmap failed for snapshot memory ({} bytes): {}", mem_size, std::io::Error::last_os_error());
+        }
+
+        let guest_memory = crate::memory::GuestMem::from_raw(ptr as *mut u8, mem_size);
+        tracing::info!("Restored VM memory: {}MB from snapshot", mem_size >> 20);
+
+        // 2. Register memory regions with KVM
+        let mmio_hole_start: u64 = 0xC000_0000;
+        let mmio_hole_end: u64 = 0x1_0000_0000;
+        let guard_size: u64 = 128 << 20;
+
+        let alloc_size = if mem_size <= mmio_hole_start {
+            mem_size + guard_size
+        } else {
+            mmio_hole_start + (mem_size - mmio_hole_start) + guard_size
+        };
+
+        if mem_size <= mmio_hole_start {
+            let mem_region = kvm_userspace_memory_region {
+                slot: 0,
+                guest_phys_addr: 0,
+                memory_size: alloc_size,
+                userspace_addr: guest_memory.as_ptr() as u64,
+                flags: KVM_MEM_LOG_DIRTY_PAGES,
+            };
+            unsafe {
+                self.vm_fd.set_user_memory_region(mem_region)
+                    .context("Failed to set KVM memory region")?;
+            }
+        } else {
+            let above_hole = mem_size - mmio_hole_start;
+            let region0 = kvm_userspace_memory_region {
+                slot: 0,
+                guest_phys_addr: 0,
+                memory_size: mmio_hole_start,
+                userspace_addr: guest_memory.as_ptr() as u64,
+                flags: KVM_MEM_LOG_DIRTY_PAGES,
+            };
+            unsafe {
+                self.vm_fd.set_user_memory_region(region0)
+                    .context("Failed to set KVM memory region (slot 0)")?;
+            }
+            let region1 = kvm_userspace_memory_region {
+                slot: 1,
+                guest_phys_addr: mmio_hole_end,
+                memory_size: above_hole + guard_size,
+                userspace_addr: (guest_memory.as_ptr() as u64) + mmio_hole_start,
+                flags: KVM_MEM_LOG_DIRTY_PAGES,
+            };
+            unsafe {
+                self.vm_fd.set_user_memory_region(region1)
+                    .context("Failed to set KVM memory region (slot 1)")?;
+            }
+        }
+        self.mem_size = mem_size;
+        self.kvm_slot_size = alloc_size;
+
+        // 3. Create irqchip + PIT, restore state
+        self.vm_fd.create_irq_chip()
+            .context("Failed to create irqchip")?;
+        let pit_config = kvm_pit_config { flags: KVM_PIT_SPEAKER_DUMMY, ..Default::default() };
+        self.vm_fd.create_pit2(pit_config)
+            .context("Failed to create PIT")?;
+        setup_gsi_routing(&self.vm_fd)?;
+
+        // Restore PIT
+        if !template.device_states.pit.is_empty() {
+            let expected = std::mem::size_of::<kvm_bindings::kvm_pit_state2>();
+            if template.device_states.pit.len() == expected {
+                let pit_state = unsafe {
+                    std::ptr::read(template.device_states.pit.as_ptr() as *const kvm_bindings::kvm_pit_state2)
+                };
+                self.vm_fd.set_pit2(&pit_state).context("Failed to restore PIT")?;
+            }
+        }
+
+        // Restore irqchip
+        if template.device_states.irqchip.len() == 3 {
+            let expected_size = std::mem::size_of::<kvm_bindings::kvm_irqchip>();
+            for (i, name) in ["PIC_MASTER", "PIC_SLAVE", "IOAPIC"].iter().enumerate() {
+                if template.device_states.irqchip[i].len() == expected_size {
+                    let chip = unsafe {
+                        std::ptr::read(template.device_states.irqchip[i].as_ptr() as *const kvm_bindings::kvm_irqchip)
+                    };
+                    self.vm_fd.set_irqchip(&chip).context(format!("Failed to restore {name}"))?;
+                }
+            }
+            tracing::info!("Restored irqchip from snapshot");
+        }
+
+        // 4. Register virtio devices (same order as original boot)
+        // Parse saved guest_ip string back to [u8; 4] for config
+        if let Some(ref ip_str) = template.guest_ip {
+            if let Ok(addr) = ip_str.parse::<std::net::Ipv4Addr>() {
+                self.config.guest_ip = Some(addr.octets());
+            }
+        }
+
+        {
+            let mut mmio_bus = self.mmio_bus.lock().unwrap();
+
+            let balloon_mem_size = if mem_size > mmio_hole_start {
+                mmio_hole_end + (mem_size - mmio_hole_start)
+            } else { mem_size };
+            let balloon = VirtioBalloon::new(guest_memory.as_ptr(), balloon_mem_size);
+            self.balloon_num_pages = Some(Arc::clone(&balloon.config().num_pages));
+            let (_base, irq) = mmio_bus.register(Box::new(balloon));
+            self.balloon_irq = Some(irq);
+
+            // vsock with new CID
+            let mut identity = identity::generate_identity()?;
+            if let Some(ip) = self.config.guest_ip {
+                identity.ip_address = ip;
+            }
+            let cid = identity.vsock_cid as u64;
+            match VirtioVsock::new(cid) {
+                Ok(mut vsock) => {
+                    let dev_idx = mmio_bus.device_count();
+                    let predicted_irq = crate::virtio::IRQ_BASE + dev_idx as u32;
+                    self.vsock_host_fd = Some(vsock.take_host_fd());
+                    self.vsock_dev_index = Some(dev_idx);
+                    self.vsock_irq = Some(predicted_irq);
+                    mmio_bus.register(Box::new(vsock));
+                }
+                Err(e) => { tracing::warn!("Failed to create vsock: {e}"); }
+            }
+
+            // Block device from template or config
+            let block_path = self.config.block_device.clone()
+                .or_else(|| template.block_device.clone());
+            if let Some(ref bp) = block_path {
+                match crate::virtio::block::VirtioBlock::open(bp, false) {
+                    Ok(block) => { mmio_bus.register(Box::new(block)); }
+                    Err(e) => { tracing::warn!("Failed to open block {bp}: {e}"); }
+                }
+            }
+
+            // Overlay block device from template or config
+            let overlay_path = self.config.overlay_device.clone()
+                .or_else(|| template.overlay_path.clone());
+            if let Some(ref op) = overlay_path {
+                match crate::virtio::block::VirtioBlock::open(op, false) {
+                    Ok(block) => {
+                        mmio_bus.register(Box::new(block));
+                        tracing::info!("Restore: overlay block registered: {op}");
+                    }
+                    Err(e) => { tracing::warn!("Failed to open overlay {op}: {e}"); }
+                }
+            }
+
+            // virtio-fs
+            if let Some(ref shared_dir_spec) = self.config.shared_dir {
+                let parts: Vec<&str> = shared_dir_spec.splitn(3, ':').collect();
+                let (dir_path, tag) = match parts.len() {
+                    1 => (parts[0].to_string(), "fs0".to_string()),
+                    2 => (parts[0].to_string(), parts[1].to_string()),
+                    3 => (parts[0].to_string(), parts[1].to_string()),
+                    _ => unreachable!(),
+                };
+                let root_dir = std::path::PathBuf::from(&dir_path);
+                if root_dir.is_dir() {
+                    let fs_dev = crate::virtio::fs::VirtioFs::new(root_dir, tag.clone());
+                    mmio_bus.register(Box::new(fs_dev));
+                }
+            }
+
+            // virtio-net with fresh TAP (reuse same IP via auto_setup_network)
+            if let Some(ref tap_name) = self.config.tap_device {
+                let tap_result = if let Some(fd) = self.config.tap_fd {
+                    Ok(fd)
+                } else {
+                    crate::net::create_tap(tap_name)
+                };
+                match tap_result {
+                    Ok(tap_fd) => {
+                        let mac = identity.mac_address;
+                        let net_dev = crate::virtio::net::VirtioNet::new(tap_fd, mac);
+                        let dev_index = mmio_bus.device_count();
+                        let (_base, actual_irq) = mmio_bus.register(Box::new(net_dev));
+                        unsafe {
+                            let flags = libc::fcntl(tap_fd, libc::F_GETFL);
+                            libc::fcntl(tap_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                        }
+                        let notify_addr = crate::virtio::MMIO_BASE + dev_index as u64 * MMIO_STRIDE + 0x50;
+                        let kick_evt = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+                        if kick_evt >= 0 {
+                            let mut ioeventfd = kvm_bindings::kvm_ioeventfd {
+                                datamatch: 1, len: 4, addr: notify_addr, fd: kick_evt,
+                                flags: 1, ..Default::default()
+                            };
+                            let ret = unsafe {
+                                libc::ioctl(self.vm_fd.as_raw_fd(), 0x4040AE79u64 as libc::c_ulong, &ioeventfd)
+                            };
+                            if ret != 0 {
+                                ioeventfd.flags = 0;
+                                ioeventfd.datamatch = 0;
+                                unsafe { libc::ioctl(self.vm_fd.as_raw_fd(), 0x4040AE79u64 as libc::c_ulong, &ioeventfd); }
+                            }
+                        }
+                        self.net_tap_info = Some((tap_fd, dev_index, actual_irq, kick_evt));
+                    }
+                    Err(e) => { tracing::warn!("Failed to create TAP {tap_name}: {e}"); }
+                }
+            }
+
+            mmio_bus.set_guest_memory_with_hole(guest_memory.as_ptr(), guest_memory.size(), guest_memory.hole_start(), guest_memory.hole_end());
+
+            // Restore transport states from snapshot
+            if !template.device_states.transports.is_empty() {
+                mmio_bus.restore_all_from_json(&template.device_states.transports)?;
+            }
+
+            // DO NOT inject new identity or send vsock transport reset
+            // — this is the SAME VM being restored, not a fork.
+        }
+
+        // 5. Restore vCPU states
+        let num_vcpus = template.vcpu_states.len();
+        for (id, vcpu_state) in template.vcpu_states.iter().enumerate() {
+            let vcpu = vcpu::Vcpu::from_template(
+                &self.kvm,
+                &self.vm_fd,
+                id as u32,
+                vcpu_state,
+                Arc::clone(&self.mmio_bus),
+                Arc::clone(&self.serial),
+            )?;
+            let _ = vcpu.fd().kvmclock_ctrl();
+            self.vcpus.push(vcpu);
+        }
+
+        self.guest_memory = Some(guest_memory);
+
+        tracing::info!("Restored VM from snapshot: {}MB, {} vCPUs", mem_size >> 20, num_vcpus);
         Ok(())
     }
 
@@ -1179,6 +1451,8 @@ impl Vm {
             vm_fd: Some(Arc::clone(&self.vm_fd)),
             agent_state: Some(Arc::clone(&agent_state)),
             block_device: self.config.block_device.clone(),
+            overlay_path: self.config.overlay_device.clone(),
+            guest_ip: self.config.guest_ip.map(|ip| format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])),
         });
 
         match crate::control::sync_server::start_control_socket(Arc::clone(&vm_handle)) {

@@ -110,6 +110,12 @@ pub struct TemplateSnapshot {
     /// Used to restore kvmclock on fork so the guest's clocksource works.
     #[serde(default)]
     pub clock_ns: u64,
+    /// Overlay block device path for save/restore (persistent writable layer).
+    #[serde(default)]
+    pub overlay_path: Option<String>,
+    /// Guest IP address at snapshot time (used to restore same IP).
+    #[serde(default)]
+    pub guest_ip: Option<String>,
 }
 
 /// Metadata file name stored alongside the memory dump.
@@ -191,6 +197,8 @@ pub fn save_template(
     output_dir: &str,
     block_device: Option<String>,
     clock_ns: u64,
+    overlay_path: Option<String>,
+    guest_ip: Option<String>,
 ) -> Result<TemplateSnapshot> {
     use crate::boot::measured::compute_sha256;
 
@@ -218,6 +226,8 @@ pub fn save_template(
         memory_hash: hash_hex,
         block_device,
         clock_ns,
+        overlay_path,
+        guest_ip,
     };
 
     snapshot.save_metadata(output_dir)?;

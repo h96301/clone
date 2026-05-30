@@ -106,6 +106,10 @@ fn main() {
     if Path::new("/lib/modules/overlay.ko").exists() {
         load_module("/lib/modules/overlay.ko");
     }
+    // virtiofs.ko for --shared-dir directory sharing
+    if Path::new("/lib/modules/virtiofs.ko").exists() {
+        load_module("/lib/modules/virtiofs.ko");
+    }
 
     // Parse kernel command line
     let cmdline = read_cmdline();
@@ -242,6 +246,46 @@ fn main() {
         }
     }
 
+    // Auto-configure guest networking from cmdline
+    if let Some(net_ip) = parse_param(&cmdline, "clone.net_ip") {
+        let gateway = parse_param(&cmdline, "clone.net_gw").unwrap_or("172.30.0.1");
+        let netmask = parse_param(&cmdline, "clone.net_mask").unwrap_or("255.255.0.0");
+
+        // Wait for eth0 to appear
+        for _ in 0..50 {
+            if Path::new("/sys/class/net/eth0").exists() { break; }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        if Path::new("/sys/class/net/eth0").exists() {
+            configure_interface("eth0", net_ip, netmask);
+            add_default_route(gateway);
+            // DNS — remove symlink first, then write static file
+            let _ = std::fs::remove_file("/etc/resolv.conf");
+            let _ = fs::write("/etc/resolv.conf", "nameserver 8.8.8.8\nnameserver 8.8.4.4\n");
+
+            // Disable SSH DNS reverse lookup to speed up login
+            fix_sshd_dns();
+
+            msg(&format!("[clone-init] network: eth0 {net_ip}/{netmask} gw {gateway}"));
+        }
+    }
+
+    // Auto-mount virtio-fs shared directory if clone.shared_dir=tag:/mount/path is set
+    if let Some(shared_dir_val) = parse_param(&cmdline, "clone.shared_dir") {
+        let parts: Vec<&str> = shared_dir_val.splitn(2, ':').collect();
+        if parts.len() == 2 {
+            let tag = parts[0];
+            let mount_point = parts[1];
+            mkdir(mount_point);
+            if mount_fs(tag, mount_point, "virtiofs", 0) {
+                msg(&format!("[clone-init] auto-mounted virtiofs {tag} -> {mount_point}"));
+            } else {
+                msg(&format!("[clone-init] failed to mount virtiofs {tag} -> {mount_point}"));
+            }
+        }
+    }
+
     // Start clone-agent in background before exec'ing init
     if Path::new("/usr/local/bin/clone-agent").exists() {
         msg("[clone-init] starting clone-agent");
@@ -297,6 +341,76 @@ fn parse_param<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Disable DNS reverse lookup in sshd to speed up SSH login.
+fn fix_sshd_dns() {
+    let path = "/etc/ssh/sshd_config";
+    if !Path::new(path).exists() { return; }
+    if let Ok(content) = fs::read_to_string(path) {
+        if content.contains("UseDNS no") { return; }
+        let mut new_content = content;
+        // Remove any existing UseDNS line
+        new_content = new_content.lines()
+            .filter(|l| !l.trim().starts_with("UseDNS"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        new_content.push_str("\nUseDNS no\n");
+        let _ = fs::write(path, new_content);
+    }
+}
+
+/// Configure IP address on a network interface via SIOCSIFADDR ioctl.
+/// Also brings the interface up.
+#[cfg(target_os = "linux")]
+fn configure_interface(iface: &str, ip: &str, netmask: &str) {
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 { return; }
+
+    let mut ifr = [0u8; 40];
+    let name_bytes = iface.as_bytes();
+    let copy_len = std::cmp::min(name_bytes.len(), 15);
+    ifr[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
+    // Bring interface up first
+    const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
+    const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
+    let ret = unsafe { libc::ioctl(sock, SIOCGIFFLAGS, ifr.as_mut_ptr()) };
+    if ret >= 0 {
+        let flags = i16::from_ne_bytes([ifr[16], ifr[17]]);
+        let new_flags = flags | (libc::IFF_UP as i16);
+        ifr[16..18].copy_from_slice(&new_flags.to_ne_bytes());
+        unsafe { libc::ioctl(sock, SIOCSIFFLAGS, ifr.as_ptr()); }
+    }
+
+    let family = (libc::AF_INET as u16).to_ne_bytes();
+    ifr[16] = family[0]; ifr[17] = family[1];
+    ifr[18] = 0; ifr[19] = 0;
+
+    // Set IP
+    if let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() {
+        let octets = addr.octets();
+        ifr[20..24].copy_from_slice(&octets);
+        unsafe { libc::ioctl(sock, 0x8916u64, ifr.as_ptr()); } // SIOCSIFADDR
+    }
+
+    // Set netmask
+    if let Ok(nm) = netmask.parse::<std::net::Ipv4Addr>() {
+        let octets = nm.octets();
+        ifr[20..24].copy_from_slice(&octets);
+        unsafe { libc::ioctl(sock, 0x891Cu64, ifr.as_ptr()); } // SIOCSIFNETMASK
+    }
+
+    unsafe { libc::close(sock); }
+}
+
+/// Add default route via gateway using netlink.
+#[cfg(target_os = "linux")]
+fn add_default_route(gateway: &str) {
+    // Simple approach: use ip route command (available in Ubuntu rootfs)
+    let _ = std::process::Command::new("ip")
+        .args(["route", "replace", "default", "via", gateway])
+        .status();
 }
 
 fn mkdir(path: &str) {
@@ -462,10 +576,10 @@ fn setup_overlay_block() -> &'static str {
 
     mkdir("/mnt/overlay");
 
-    // Try to mount as ext4 first (already formatted)
+    // Try to mount as ext4 (should be pre-formatted by host)
     if !mount_fs(overlay_dev, "/mnt/overlay", "ext4", 0) {
-        // Not formatted yet — format it
-        msg("[clone-init] formatting overlay device with ext4");
+        // Not formatted — try mkfs.ext4 if available
+        msg("[clone-init] overlay not formatted, attempting mkfs.ext4");
         let status = std::process::Command::new("/sbin/mkfs.ext4")
             .args(["-q", "-F", overlay_dev])
             .status();

@@ -42,6 +42,10 @@ pub struct VmHandle {
     pub agent_state: Option<Arc<crate::vmm::agent_listener::AgentState>>,
     /// Block device path (rootfs image) for saving in template metadata.
     pub block_device: Option<String>,
+    /// Overlay block device path (persistent writable layer).
+    pub overlay_path: Option<String>,
+    /// Guest IP address (for save/restore to reassign same IP).
+    pub guest_ip: Option<String>,
 }
 
 // SAFETY: VmHandle contains a raw pointer to guest memory, which is
@@ -534,6 +538,8 @@ fn handle_snapshot(vm: &VmHandle, output_path: &str) -> Response {
             output_path,
             vm.block_device.clone(),
             clock_ns,
+            vm.overlay_path.clone(),
+            vm.guest_ip.clone(),
         )
     };
 
