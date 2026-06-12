@@ -683,6 +683,7 @@ pub fn run_receiver(
         block_device: None,
         overlay_path: None,
         guest_ip: None,
+        serial: Arc::clone(&serial),
     });
 
     match crate::control::sync_server::start_control_socket(Arc::clone(&vm_handle)) {

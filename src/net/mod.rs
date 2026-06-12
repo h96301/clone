@@ -9,6 +9,9 @@
 // - Static IP injection via guest agent (no DHCP)
 // - Port forwarding for dev shell access
 
+#[cfg(target_os = "linux")]
+pub mod netns;
+
 use std::os::unix::io::RawFd;
 
 /// Network configuration for a VM.

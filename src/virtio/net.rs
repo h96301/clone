@@ -831,6 +831,15 @@ impl VirtioDevice for VirtioNet {
         if let Some(v) = state.get("acked_features_high").and_then(|v| v.as_u64()) {
             self.acked_features_high = v as u32;
         }
+        // Restore MAC address to match guest OS expectation after restore
+        if let Some(mac_array) = state.get("mac").and_then(|v| v.as_array()) {
+            let mac_bytes: Vec<u8> = mac_array.iter()
+                .filter_map(|v| v.as_u64().map(|u| u as u8))
+                .collect();
+            if mac_bytes.len() == 6 {
+                self.mac.copy_from_slice(&mac_bytes);
+            }
+        }
         Ok(())
     }
 }

@@ -1064,6 +1064,13 @@ impl Vm {
                 mmio_bus.restore_all_from_json(&template.device_states.transports)?;
             }
 
+            // Restore serial port state so guest kernel 8250 driver
+            // sees consistent UART registers (prevents TTYVHangup killing foreground processes).
+            if let Some(ref serial_data) = template.device_states.serial {
+                self.serial.lock().unwrap().restore_state(serial_data);
+                tracing::info!("Restored serial device state from snapshot");
+            }
+
             // DO NOT inject new identity or send vsock transport reset
             // — this is the SAME VM being restored, not a fork.
         }
@@ -1084,6 +1091,15 @@ impl Vm {
         }
 
         self.guest_memory = Some(guest_memory);
+
+        // Sync block_device/overlay_path from template to config so that
+        // subsequent saves include these paths (config is what VmHandle reads).
+        if self.config.block_device.is_none() && template.block_device.is_some() {
+            self.config.block_device = template.block_device.clone();
+        }
+        if self.config.overlay_device.is_none() && template.overlay_path.is_some() {
+            self.config.overlay_device = template.overlay_path.clone();
+        }
 
         tracing::info!("Restored VM from snapshot: {}MB, {} vCPUs", mem_size >> 20, num_vcpus);
         Ok(())
@@ -1453,6 +1469,7 @@ impl Vm {
             block_device: self.config.block_device.clone(),
             overlay_path: self.config.overlay_device.clone(),
             guest_ip: self.config.guest_ip.map(|ip| format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])),
+            serial: Arc::clone(&self.serial),
         });
 
         match crate::control::sync_server::start_control_socket(Arc::clone(&vm_handle)) {

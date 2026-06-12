@@ -112,12 +112,14 @@ pub fn find_agent_binary() -> Option<PathBuf> {
 /// These are placed at `/lib/modules/` (flat) in the initrd so clone-init
 /// can load them before switching root into the real rootfs.
 fn embed_kernel_modules(cpio: &mut Vec<u8>) {
-    let uname = match std::process::Command::new("uname").arg("-r").output() {
-        Ok(o) if o.status.success() => {
+    let uname = std::env::var("CLONE_KERNEL_RELEASE")
+        .unwrap_or_else(|_| {
+            let o = std::process::Command::new("uname")
+                .arg("-r")
+                .output()
+                .expect("uname failed");
             String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
-        _ => return,
-    };
+        });
 
     let mod_root = PathBuf::from(format!("/lib/modules/{uname}"));
     if !mod_root.is_dir() {

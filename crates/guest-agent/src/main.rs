@@ -66,38 +66,41 @@ fn on_reconnect() {
 
 /// Clean up stale state after VM fork (D-Bus sockets, services, etc).
 /// Only runs when identity IP changes (actual fork).
+/// Runs in background to avoid blocking agent reconnection.
 fn cleanup_after_fork() {
-    // Restart D-Bus to clear stale sockets
-    let _ = std::process::Command::new("systemctl")
-        .args(["restart", "dbus"]).output();
-    // Remove stale user session sockets
-    let _ = std::fs::remove_file("/run/nologin");
-    if let Ok(entries) = std::fs::read_dir("/run/user") {
-        for entry in entries.flatten() {
-            let bus = entry.path().join("bus");
-            let _ = std::fs::remove_file(&bus);
+    std::thread::spawn(|| {
+        // Restart D-Bus to clear stale sockets
+        let _ = std::process::Command::new("systemctl")
+            .args(["restart", "dbus"]).output();
+        // Remove stale user session sockets
+        let _ = std::fs::remove_file("/run/nologin");
+        if let Ok(entries) = std::fs::read_dir("/run/user") {
+            for entry in entries.flatten() {
+                let bus = entry.path().join("bus");
+                let _ = std::fs::remove_file(&bus);
+            }
         }
-    }
-    // Restart services that use Go runtime (crashes after fork due to
-    // stale goroutine stacks). Latch is the main one.
-    let _ = std::process::Command::new("systemctl")
-        .args(["restart", "latch"]).output();
-    // Restart user latch service if lingering is enabled
-    if let Ok(entries) = std::fs::read_dir("/home") {
-        for entry in entries.flatten() {
-            let user = entry.file_name();
-            let _ = std::process::Command::new("su")
-                .args(["-c", "systemctl --user restart latch 2>/dev/null", user.to_str().unwrap_or("shell")])
-                .output();
+        // Restart services that use Go runtime (crashes after fork due to
+        // stale goroutine stacks). Latch is the main one.
+        let _ = std::process::Command::new("systemctl")
+            .args(["restart", "latch"]).output();
+        // Restart user latch service if lingering is enabled
+        if let Ok(entries) = std::fs::read_dir("/home") {
+            for entry in entries.flatten() {
+                let user = entry.file_name();
+                let _ = std::process::Command::new("su")
+                    .args(["-c", "systemctl --user restart latch 2>/dev/null", user.to_str().unwrap_or("shell")])
+                    .output();
+            }
         }
-    }
-    // Rebind virtio-balloon driver — the balloon device state from the
-    // snapshot doesn't properly reconnect after fork. Unbind+bind forces
-    // the guest kernel to re-probe the device with fresh VMM state.
-    let _ = std::process::Command::new("bash")
-        .args(["-c", "echo virtio0 > /sys/bus/virtio/drivers/virtio_balloon/unbind 2>/dev/null; sleep 0.5; echo virtio0 > /sys/bus/virtio/drivers/virtio_balloon/bind 2>/dev/null"])
-        .output();
-    eprintln!("clone-agent: cleaned up stale state after fork");
+        // Rebind virtio-balloon driver — the balloon device state from the
+        // snapshot doesn't properly reconnect after fork. Unbind+bind forces
+        // the guest kernel to re-probe the device with fresh VMM state.
+        let _ = std::process::Command::new("bash")
+            .args(["-c", "echo virtio0 > /sys/bus/virtio/drivers/virtio_balloon/unbind 2>/dev/null; sleep 0.5; echo virtio0 > /sys/bus/virtio/drivers/virtio_balloon/bind 2>/dev/null"])
+            .output();
+        eprintln!("clone-agent: cleaned up stale state after fork (background)");
+    });
 }
 
 /// Read IP from the identity page injected by the VMM.
@@ -263,11 +266,22 @@ fn main() {
         close_fd(fd);
         eprintln!("clone-agent: disconnected, reconnecting...");
 
+        // Detect fork: identity page IP differs from cmdline baseline
+        let new_ip = read_identity_ip();
+        let is_fork = match (&current_ip, &new_ip) {
+            (Some(old), Some(new_ip)) => old != new_ip,
+            _ => false,
+        };
+        if is_fork {
+            if let Some(ref ip) = new_ip {
+                eprintln!("clone-agent: fork detected (IP changed to {ip})");
+            }
+            current_ip = new_ip;
+            cleanup_after_fork();
+        }
+
         // Run reconnect tasks in background — don't block agent readiness.
-        // Network setup and fork cleanup are handled by shell-setup.sh
-        // via exec (vsock), which requires the agent to be available.
         on_reconnect();
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -347,6 +361,10 @@ fn run_agent(fd: i32) {
                                             let mut r = std::io::BufReader::new(err);
                                             let _ = std::io::Read::read_to_end(&mut r, &mut stderr_data);
                                         }
+                                        // Truncate output to avoid vsock message size issues
+                                        const MAX_OUTPUT: usize = 65536;
+                                        stdout_data.truncate(MAX_OUTPUT);
+                                        stderr_data.truncate(MAX_OUTPUT);
                                         return Ok(std::process::Output {
                                             status,
                                             stdout: stdout_data,
@@ -354,7 +372,7 @@ fn run_agent(fd: i32) {
                                         });
                                     }
                                     Ok(None) => {
-                                        if start.elapsed() > Duration::from_secs(30) {
+                                        if start.elapsed() > Duration::from_secs(300) {
                                             let _ = child.kill();
                                             let _ = child.wait();
                                             return Err(std::io::Error::new(
@@ -620,21 +638,22 @@ fn send_message(fd: i32, msg: &AgentMessage) -> Result<(), ()> {
     buf.extend_from_slice(&len);
     buf.extend_from_slice(&json);
 
-    let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
-    let poll_ret = unsafe { libc::poll(&mut pfd, 1, 3000) };
-    if poll_ret <= 0 || (pfd.revents & (libc::POLLERR | libc::POLLHUP)) != 0 {
-        return Err(());
+    let mut offset = 0;
+    while offset < buf.len() {
+        let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        let poll_ret = unsafe { libc::poll(&mut pfd, 1, 5000) };
+        if poll_ret <= 0 || (pfd.revents & (libc::POLLERR | libc::POLLHUP)) != 0 {
+            return Err(());
+        }
+        let n = unsafe {
+            libc::write(fd, buf[offset..].as_ptr() as *const libc::c_void, buf.len() - offset)
+        };
+        if n <= 0 {
+            return Err(());
+        }
+        offset += n as usize;
     }
-
-    let written = unsafe {
-        libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len())
-    };
-
-    if written as usize == buf.len() {
-        Ok(())
-    } else {
-        Err(())
-    }
+    Ok(())
 }
 
 fn recv_message(fd: i32) -> Option<VmmMessage> {

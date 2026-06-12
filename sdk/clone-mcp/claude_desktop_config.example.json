@@ -1,0 +1,13 @@
+{
+  "_comment": "Sample Claude Desktop config. Copy to ~/.config/claude/claude_desktop_config.json (macOS: ~/Library/Application Support/Claude/) and edit CLONE_TOKEN/URL.",
+  "mcpServers": {
+    "clone": {
+      "command": "python3",
+      "args": ["/absolute/path/to/clone/sdk/clone-mcp/server.py"],
+      "env": {
+        "CLONE_URL": "http://127.0.0.1:8080",
+        "CLONE_TOKEN": "REPLACE_WITH_YOUR_TOKEN"
+      }
+    }
+  }
+}

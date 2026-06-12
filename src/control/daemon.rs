@@ -89,7 +89,8 @@ pub fn spawn_vm(
 /// Spawn a forked VM from a template snapshot.
 ///
 /// Runs `clone fork --template <path>` as a child process with optional
-/// networking and CID assignment.
+/// networking and CID assignment. The new VM uses CoW mmap to share
+/// memory pages with the template — ideal for fast, lightweight clones.
 pub fn spawn_fork(
     template_path: &str,
     net: bool,
@@ -134,6 +135,49 @@ pub fn spawn_fork(
 
     let pid = child.id();
     tracing::info!(pid, template = template_path, "Spawned forked VM");
+
+    std::mem::forget(child);
+    Ok(pid)
+}
+
+/// Spawn a restored VM from a saved snapshot.
+///
+/// Runs `clone restore --snapshot <path>` as a child process.
+/// Unlike fork (CoW shared memory), restore loads an independent copy of
+/// the saved memory and replays the full vCPU/device state so the VM
+/// resumes exactly where it left off.
+pub fn spawn_restore(
+    snapshot_path: &str,
+    net: bool,
+    shared_dir: Option<&str>,
+    block: Option<&str>,
+) -> Result<u32> {
+    let exe = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("clone"));
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("restore")
+        .arg("--snapshot").arg(snapshot_path);
+
+    if net {
+        cmd.arg("--net");
+    }
+    if let Some(sd) = shared_dir {
+        cmd.arg("--shared-dir").arg(sd);
+    }
+    if let Some(b) = block {
+        cmd.arg("--block").arg(b);
+    }
+
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    let child = cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn restore process: {e}"))?;
+
+    let pid = child.id();
+    tracing::info!(pid, snapshot = snapshot_path, "Spawned restored VM");
 
     std::mem::forget(child);
     Ok(pid)
@@ -207,13 +251,112 @@ pub fn query_vm_status(control_socket: &str) -> Result<crate::control::protocol:
     Ok(response)
 }
 
+/// Forward a Pause request to a VM's per-VM control socket.
+pub fn pause_vm(control_socket: &str) -> Result<crate::control::protocol::Response> {
+    forward_simple(control_socket, crate::control::protocol::Request::Pause)
+}
+
+/// Forward a Resume request to a VM's per-VM control socket.
+pub fn resume_vm(control_socket: &str) -> Result<crate::control::protocol::Response> {
+    forward_simple(control_socket, crate::control::protocol::Request::Resume)
+}
+
+/// Forward a Shutdown request to a VM's per-VM control socket.
+pub fn shutdown_vm_forward(control_socket: &str) -> Result<crate::control::protocol::Response> {
+    forward_simple(control_socket, crate::control::protocol::Request::Shutdown)
+}
+
+/// Forward an Exec request to a VM's per-VM control socket.
+pub fn exec_vm(
+    control_socket: &str,
+    command: &str,
+    args: Vec<String>,
+) -> Result<crate::control::protocol::Response> {
+    forward_simple(
+        control_socket,
+        crate::control::protocol::Request::Exec {
+            command: command.to_string(),
+            args,
+        },
+    )
+}
+
+/// Forward a SetBalloon request to a VM's per-VM control socket.
+pub fn set_balloon_vm(
+    control_socket: &str,
+    target_mb: u32,
+) -> Result<crate::control::protocol::Response> {
+    forward_simple(
+        control_socket,
+        crate::control::protocol::Request::SetBalloon { target_mb },
+    )
+}
+
+/// Forward an IncrementalSnapshot request to a VM's per-VM control socket.
+pub fn incremental_snapshot_vm(
+    control_socket: &str,
+    output_path: &str,
+    base_template: &str,
+) -> Result<crate::control::protocol::Response> {
+    forward_simple(
+        control_socket,
+        crate::control::protocol::Request::IncrementalSnapshot {
+            output_path: output_path.to_string(),
+            base_template: base_template.to_string(),
+        },
+    )
+}
+
+/// Forward a LiveMigrate request to a VM's per-VM control socket.
+pub fn live_migrate_vm(
+    control_socket: &str,
+    dest_host: &str,
+    dest_port: u16,
+) -> Result<crate::control::protocol::Response> {
+    forward_simple(
+        control_socket,
+        crate::control::protocol::Request::LiveMigrate {
+            dest_host: dest_host.to_string(),
+            dest_port,
+        },
+    )
+}
+
+/// Generic synchronous request forwarder used by all per-VM proxy functions.
+fn forward_simple(
+    control_socket: &str,
+    request: crate::control::protocol::Request,
+) -> Result<crate::control::protocol::Response> {
+    use std::io::{BufReader, BufWriter};
+
+    let stream = std::os::unix::net::UnixStream::connect(control_socket)
+        .map_err(|e| anyhow::anyhow!("Failed to connect to VM socket {control_socket}: {e}"))?;
+
+    // Generous timeout for snapshot/migrate operations.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+
+    let mut writer = BufWriter::new(&stream);
+    let mut reader = BufReader::new(&stream);
+
+    crate::control::protocol::write_frame_sync(&mut writer, &request)?;
+    let response: crate::control::protocol::Response =
+        crate::control::protocol::read_frame_sync(&mut reader)?;
+
+    Ok(response)
+}
 
 /// Run the daemon.
 ///
-/// Starts the control server and child process monitor.
-pub async fn run_daemon(socket_path: &str) -> Result<()> {
+/// Starts the Unix control server, optional HTTP REST API server, and
+/// the child process monitor.
+pub async fn run_daemon(
+    socket_path: &str,
+    http_bind: Option<String>,
+    auth_token: Option<String>,
+) -> Result<()> {
     eprintln!("Clone daemon listening on {socket_path}");
-    tracing::info!(socket = socket_path, "Daemon starting");
+    tracing::info!(socket = socket_path, http_bind = ?http_bind, "Daemon starting");
 
     let server = crate::control::ControlServer::new(socket_path);
 
@@ -221,6 +364,19 @@ pub async fn run_daemon(socket_path: &str) -> Result<()> {
     // The monitor checks if tracked VM processes are still alive and
     // marks dead ones as Stopped.
     start_server_monitor(server.state());
+
+    // Optionally start the HTTP REST API in parallel.
+    if let Some(addr) = http_bind {
+        let http_state = crate::control::http::HttpState {
+            vm_state: server.state(),
+            auth_token,
+        };
+        tokio::spawn(async move {
+            if let Err(e) = crate::control::http::run_http_server(http_state, &addr).await {
+                tracing::error!(error = %e, "HTTP server terminated");
+            }
+        });
+    }
 
     server.run().await
 }

@@ -23,10 +23,17 @@ anyhow = "1"
 thiserror = "2"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # unix
 libc = "0.2"
+
+# HTTP server (REST API)
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio", "query"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Prometheus metrics
+prometheus = "0.13"
 
 # cryptography — cross-platform
 sha2 = "0.10"

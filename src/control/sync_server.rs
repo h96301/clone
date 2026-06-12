@@ -46,6 +46,8 @@ pub struct VmHandle {
     pub overlay_path: Option<String>,
     /// Guest IP address (for save/restore to reassign same IP).
     pub guest_ip: Option<String>,
+    /// Serial port device (for saving/restoring UART state).
+    pub serial: Arc<std::sync::Mutex<crate::vmm::serial::Serial>>,
 }
 
 // SAFETY: VmHandle contains a raw pointer to guest memory, which is
@@ -171,6 +173,9 @@ fn dispatch(req: Request, vm: &VmHandle) -> Response {
         Request::Resume => handle_resume(vm),
         Request::Shutdown => handle_shutdown(vm),
         Request::LiveMigrate { dest_host, dest_port } => handle_live_migrate(vm, &dest_host, dest_port),
+        Request::Branch { output_dir, net, shared_dir } => {
+            handle_branch(vm, output_dir.as_deref(), net, shared_dir.as_deref())
+        }
         Request::VmStatus { .. } => Response::Ok {
             body: ResponseBody::Status {
                 state: if vm.pause_state.pause_requested.load(Ordering::SeqCst) {
@@ -183,18 +188,27 @@ fn dispatch(req: Request, vm: &VmHandle) -> Response {
             },
         },
         Request::Exec { command, args } => {
-            match &vm.agent_state {
-                Some(agent_state) => {
-                    match agent_state.send_exec(&command, &args) {
-                        Ok((exit_code, stdout, stderr)) => Response::Ok {
-                            body: ResponseBody::ExecResult { exit_code, stdout, stderr },
-                        },
-                        Err(msg) => Response::Error { message: msg },
-                    }
-                }
-                None => Response::Error {
+            let agent_state = match &vm.agent_state {
+                Some(s) => s,
+                None => return Response::Error {
                     message: "Guest agent not available".to_string(),
                 },
+            };
+            // Wait for agent to connect after fork/cold boot (up to 30s)
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !agent_state.connected.load(std::sync::atomic::Ordering::Acquire) {
+                if std::time::Instant::now() > deadline {
+                    return Response::Error {
+                        message: "Timed out waiting for guest agent".to_string(),
+                    };
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            match agent_state.send_exec(&command, &args) {
+                Ok((exit_code, stdout, stderr)) => Response::Ok {
+                    body: ResponseBody::ExecResult { exit_code, stdout, stderr },
+                },
+                Err(msg) => Response::Error { message: msg },
             }
         }
         Request::SetBalloon { target_mb } => {
@@ -404,8 +418,9 @@ fn handle_incremental_snapshot(vm: &VmHandle, output_path: &str, base_template: 
         let transports: Vec<Vec<u8>> = transport_states.iter()
             .map(|s| serde_json::to_vec(s).unwrap_or_default())
             .collect();
+        let serial_state = vm.serial.lock().unwrap().snapshot_state();
         DeviceStates {
-            serial: None,
+            serial: Some(serial_state),
             virtio_configs: std::collections::HashMap::new(),
             transports,
             irqchip: Vec::new(),
@@ -511,8 +526,10 @@ fn handle_snapshot(vm: &VmHandle, output_path: &str) -> Response {
             }
         }
 
+        let serial_state = vm.serial.lock().unwrap().snapshot_state();
+
         DeviceStates {
-            serial: None,
+            serial: Some(serial_state),
             virtio_configs: std::collections::HashMap::new(),
             transports,
             irqchip: irqchip_states,
@@ -543,8 +560,11 @@ fn handle_snapshot(vm: &VmHandle, output_path: &str) -> Response {
         )
     };
 
-    // 4. Resume vCPUs
-    resume_vcpus(vm);
+    // 4. Do NOT resume vCPUs here — leave them paused.
+    // clone save will send a Shutdown request next, which sets
+    // SHUTDOWN_REQUESTED before resuming, so vCPUs exit immediately
+    // without re-entering KVM_RUN. This prevents the brief execution
+    // window that kills foreground processes on ttyS0.
 
     // 5. Return result
     match result {
@@ -577,6 +597,84 @@ fn handle_live_migrate(vm: &VmHandle, dest_host: &str, dest_port: u16) -> Respon
         },
         Err(e) => Response::Error {
             message: format!("Live migration failed: {e}"),
+        },
+    }
+}
+
+/// Handle a live branch request: pause source → snapshot → fork → resume.
+///
+/// The source VM stays alive throughout. The branch VM is spawned as a
+/// separate child process running `clone fork --template <tmpdir>`.
+fn handle_branch(
+    vm: &VmHandle,
+    output_dir: Option<&str>,
+    net: bool,
+    shared_dir: Option<&str>,
+) -> Response {
+    let total_start = std::time::Instant::now();
+
+    // 1. Pause source VM vCPUs
+    if let Err(msg) = pause_vcpus(vm) {
+        return Response::Error { message: format!("Branch: pause failed: {msg}") };
+    }
+    let pause_time = total_start.elapsed();
+
+    // 2. Snapshot to a temporary directory (tmpfs if not specified)
+    let snap_dir = output_dir
+        .map(String::from)
+        .unwrap_or_else(|| format!("/tmp/clone-branch-{}", std::process::id()));
+    let snap_resp = handle_snapshot(vm, &snap_dir);
+
+    // 3. Resume source VM immediately after snapshot
+    resume_vcpus(vm);
+    let resume_time = total_start.elapsed();
+
+    // Check snapshot success
+    let _ = match snap_resp {
+        Response::Ok { .. } => {},
+        Response::Error { message } => {
+            return Response::Error {
+                message: format!("Branch: snapshot failed: {message}"),
+            };
+        }
+    };
+
+    // 4. Spawn a fork VM from the snapshot
+    let fork_result = crate::control::daemon::spawn_fork(
+        &snap_dir,
+        net,
+        shared_dir,
+        None, // auto-assign CID
+        None, // mem_mb: use template default
+        None, // vcpus: use template default
+        None, // overlay_size
+    );
+
+    let total_duration = total_start.elapsed();
+
+    match fork_result {
+        Ok(pid) => {
+            let pause_ms = pause_time.as_millis() as u64;
+            let total_ms = total_duration.as_millis() as u64;
+            tracing::info!(
+                pid,
+                pause_ms,
+                total_ms,
+                snapshot = %snap_dir,
+                "Live branch completed"
+            );
+            crate::control::prometheus_metrics::observe_branch_duration(total_duration.as_secs_f64());
+            Response::Ok {
+                body: ResponseBody::BranchComplete {
+                    new_vm_id: format!("branch-{pid}"),
+                    new_pid: pid,
+                    pause_duration_ms: pause_ms,
+                    total_duration_ms: total_ms,
+                },
+            }
+        }
+        Err(e) => Response::Error {
+            message: format!("Branch: fork spawn failed: {e}"),
         },
     }
 }

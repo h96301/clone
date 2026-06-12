@@ -36,6 +36,9 @@ pub enum Request {
         seccomp: bool,
         #[serde(default)]
         jail: Option<String>,
+        /// cgroup v2 memory limit in MB (None = unlimited).
+        #[serde(default)]
+        memory_limit_mb: Option<u32>,
     },
     DestroyVm {
         vm_id: String,
@@ -63,6 +66,10 @@ pub enum Request {
         /// Overlay tmpfs size (e.g. "10G"). Passed to kernel cmdline.
         #[serde(default)]
         overlay_size: Option<String>,
+        /// cgroup v2 memory limit in MB (None = unlimited). Distinct from
+        /// mem_mb which is a balloon soft target.
+        #[serde(default)]
+        memory_limit_mb: Option<u32>,
     },
     /// Set the balloon target (number of 4 KiB pages to reclaim).
     SetBalloon {
@@ -87,10 +94,38 @@ pub enum Request {
         dest_host: String,
         dest_port: u16,
     },
+    /// Live-branch a running VM: pause → snapshot → fork → resume.
+    /// Returns a new vm_id for the branch. Source VM stays alive.
+    Branch {
+        /// Optional output dir for the intermediate snapshot (default: tmpfs).
+        #[serde(default)]
+        output_dir: Option<String>,
+        /// Whether to configure networking for the branch VM.
+        #[serde(default)]
+        net: bool,
+        /// Shared directory for the branch VM (virtio-fs).
+        #[serde(default)]
+        shared_dir: Option<String>,
+    },
     /// Execute a command inside the VM via the guest agent.
     Exec {
         command: String,
         args: Vec<String>,
+    },
+    /// Restore a previously saved VM from a snapshot.
+    /// Unlike ForkVm (CoW shared memory), restore loads an independent copy
+    /// and replays full vCPU/device state.
+    RestoreVm {
+        snapshot_path: String,
+        #[serde(default)]
+        net: bool,
+        #[serde(default)]
+        shared_dir: Option<String>,
+        #[serde(default)]
+        block: Option<String>,
+        /// cgroup v2 memory limit in MB (None = unlimited).
+        #[serde(default)]
+        memory_limit_mb: Option<u32>,
     },
 }
 
@@ -146,6 +181,16 @@ pub enum ResponseBody {
         rounds: u32,
         downtime_ms: u64,
         total_time_ms: u64,
+    },
+    BranchComplete {
+        /// vm_id of the newly-created branch VM.
+        new_vm_id: String,
+        /// PID of the new branch VM process.
+        new_pid: u32,
+        /// Time the source VM was paused (milliseconds).
+        pause_duration_ms: u64,
+        /// Total time to complete the branch (milliseconds).
+        total_duration_ms: u64,
     },
     Ack {},
 }
@@ -288,6 +333,7 @@ mod tests {
             tap: None,
             seccomp: false,
             jail: None,
+            memory_limit_mb: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let deserialized: Request = serde_json::from_str(&json).unwrap();
@@ -326,6 +372,7 @@ mod tests {
             tap: None,
             seccomp: false,
             jail: None,
+            memory_limit_mb: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let deserialized: Request = serde_json::from_str(&json).unwrap();
@@ -401,6 +448,7 @@ mod tests {
             mem_mb: Some(1024),
             vcpus: Some(2),
             overlay_size: None,
+            memory_limit_mb: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let deserialized: Request = serde_json::from_str(&json).unwrap();
@@ -513,6 +561,7 @@ mod tests {
             tap: None,
             seccomp: false,
             jail: None,
+            memory_limit_mb: None,
         };
 
         let mut buf = Vec::new();
@@ -591,6 +640,7 @@ mod tests {
             tap: None,
             seccomp: false,
             jail: None,
+            memory_limit_mb: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"cmd\":\"create_vm\""));

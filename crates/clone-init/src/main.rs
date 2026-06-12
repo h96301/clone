@@ -260,9 +260,15 @@ fn main() {
         if Path::new("/sys/class/net/eth0").exists() {
             configure_interface("eth0", net_ip, netmask);
             add_default_route(gateway);
-            // DNS — remove symlink first, then write static file
+            // DNS — unlock if chattr +i was set in image, remove symlink, write static file
+            let _ = std::process::Command::new("chattr").args(["-i", "/etc/resolv.conf"]).status();
             let _ = std::fs::remove_file("/etc/resolv.conf");
-            let _ = fs::write("/etc/resolv.conf", "nameserver 8.8.8.8\nnameserver 8.8.4.4\n");
+            let _ = fs::write("/etc/resolv.conf", "nameserver 223.5.5.5\nnameserver 8.8.8.8\n");
+            // Lock resolv.conf to prevent systemd-resolved from overwriting
+            let _ = std::process::Command::new("chattr").args(["+i", "/etc/resolv.conf"]).status();
+
+            // Write /etc/hosts to prevent slow DNS reverse lookups
+            fix_etc_hosts(net_ip, gateway);
 
             // Disable SSH DNS reverse lookup to speed up login
             fix_sshd_dns();
@@ -343,16 +349,35 @@ fn parse_param<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+/// Write /etc/hosts with VM IP, gateway, and hostname to prevent slow DNS lookups.
+/// Python's http.server calls getfqdn() at startup which resolves the hostname —
+/// without an /etc/hosts entry this triggers a DNS query that times out.
+fn fix_etc_hosts(ip: &str, gateway: &str) {
+    let hostname = fs::read_to_string("/etc/hostname").unwrap_or_default().trim().to_string();
+    let hosts = format!(
+        "127.0.0.1\tlocalhost\n\
+         ::1\t\tlocalhost\n\
+         {gateway}\thost-gateway\n\
+         {ip}\tvm-self {hostname}\n"
+    );
+    let _ = fs::write("/etc/hosts", hosts);
+}
+
 /// Disable DNS reverse lookup in sshd to speed up SSH login.
 fn fix_sshd_dns() {
     let path = "/etc/ssh/sshd_config";
     if !Path::new(path).exists() { return; }
     if let Ok(content) = fs::read_to_string(path) {
-        if content.contains("UseDNS no") { return; }
+        // Check for uncommented UseDNS no (not "#UseDNS no")
+        let already_set = content.lines().any(|l| {
+            let t = l.trim();
+            t == "UseDNS no" || t == "UseDNS  no"
+        });
+        if already_set { return; }
         let mut new_content = content;
-        // Remove any existing UseDNS line
+        // Remove any existing UseDNS line (commented or not)
         new_content = new_content.lines()
-            .filter(|l| !l.trim().starts_with("UseDNS"))
+            .filter(|l| !l.trim().starts_with("UseDNS") && !l.trim().starts_with("#UseDNS"))
             .collect::<Vec<_>>()
             .join("\n");
         new_content.push_str("\nUseDNS no\n");

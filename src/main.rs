@@ -223,6 +223,16 @@ enum Commands {
         /// Control socket path
         #[arg(long, default_value = "/run/clone/control.sock")]
         socket: String,
+
+        /// HTTP REST API bind address (e.g. "127.0.0.1:8080").
+        /// Omit to disable HTTP.
+        #[arg(long)]
+        listen: Option<String>,
+
+        /// Bearer token for HTTP API authentication.
+        /// Can also be set via CLONE_AUTH_TOKEN environment variable.
+        #[arg(long, env = "CLONE_AUTH_TOKEN")]
+        auth_token: Option<String>,
     },
     /// Create a new VM via the daemon
     Create {
@@ -265,6 +275,9 @@ enum Commands {
         /// Enable full jail (namespaces + chroot + capabilities + seccomp)
         #[arg(long)]
         jail: Option<String>,
+        /// cgroup v2 memory hard limit in MB (None = unlimited)
+        #[arg(long)]
+        memory_limit_mb: Option<u32>,
     },
     /// Destroy a VM via the daemon
     Destroy {
@@ -864,11 +877,11 @@ fn main() -> Result<()> {
                 }
             }
         },
-        Commands::Daemon { socket } => {
+        Commands::Daemon { socket, listen, auth_token } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(control::daemon::run_daemon(&socket))?;
+            rt.block_on(control::daemon::run_daemon(&socket, listen, auth_token))?;
         }
-        Commands::Create { socket, kernel, mem_mb, vcpus, initrd, rootfs, overlay, shared_dir, block, net, tap, seccomp, jail } => {
+        Commands::Create { socket, kernel, mem_mb, vcpus, initrd, rootfs, overlay, shared_dir, block, net, tap, seccomp, jail, memory_limit_mb } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let client = control::ControlClient::new(&socket);
@@ -886,6 +899,7 @@ fn main() -> Result<()> {
                     tap,
                     seccomp,
                     jail,
+                    memory_limit_mb,
                 };
                 let response = client.send(&request).await?;
                 match response {

@@ -3,9 +3,14 @@
 // Protocol: length-prefixed JSON over Unix domain socket.
 // Each message is 4 bytes LE length + JSON body.
 
+#[cfg(target_os = "linux")]
+pub mod cgroup;
 pub mod daemon;
+#[cfg(target_os = "linux")]
+pub mod http;
 pub mod jailer;
 pub mod metrics;
+pub mod prometheus_metrics;
 pub mod protocol;
 #[cfg(target_os = "linux")]
 pub mod sync_server;
@@ -35,6 +40,10 @@ pub struct VmRecord {
     pub state: VmState,
     pub boot_time: Instant,
     pub config: VmRecordConfig,
+    /// Path to the cgroup directory under /sys/fs/cgroup/clone/, if any.
+    pub cgroup_path: Option<std::path::PathBuf>,
+    /// Configured memory limit in MB (None = unlimited).
+    pub memory_limit_mb: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,7 +182,60 @@ async fn handle_connection(
     }
 }
 
-async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
+pub async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
+    let started = std::time::Instant::now();
+    let req_kind = request_kind(&req);
+    let resp = dispatch_inner(req, state).await;
+
+    // Prometheus metrics — record request-scoped timing and counters.
+    // Failures here must never break the actual response.
+    let elapsed = started.elapsed().as_secs_f64();
+    match req_kind.as_str() {
+        "fork" | "restore" => crate::control::prometheus_metrics::observe_fork_duration(elapsed),
+        "snapshot" => crate::control::prometheus_metrics::observe_snapshot_duration(elapsed),
+        _ => {}
+    }
+    resp
+}
+
+/// Classify a request for timing buckets.
+fn request_kind(req: &Request) -> String {
+    match req {
+        Request::ForkVm { .. } => "fork".into(),
+        Request::RestoreVm { .. } => "restore".into(),
+        Request::Snapshot { .. } => "snapshot".into(),
+        Request::CreateVm { .. } => "create".into(),
+        Request::DestroyVm { .. } => "destroy".into(),
+        Request::VmStatus { .. } => "status".into(),
+        Request::ListVms => "list".into(),
+        Request::Metrics { .. } => "metrics".into(),
+        _ => "other".into(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn setup_cgroup(vm_id: &str, pid: u32, memory_limit_mb: Option<u32>) -> Option<std::path::PathBuf> {
+    match crate::control::cgroup::create_vm_cgroup(vm_id, memory_limit_mb) {
+        Ok(path) => {
+            if let Err(e) = crate::control::cgroup::add_process(vm_id, pid) {
+                tracing::warn!(vm_id, pid, error = %e, "Failed to add process to cgroup");
+            }
+            Some(path)
+        }
+        Err(e) => {
+            // cgroup creation is optional — log and continue without it.
+            tracing::warn!(vm_id, error = %e, "cgroup setup skipped");
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn setup_cgroup(_vm_id: &str, _pid: u32, _memory_limit_mb: Option<u32>) -> Option<std::path::PathBuf> {
+    None
+}
+
+async fn dispatch_inner(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
     match req {
         Request::CreateVm {
             kernel,
@@ -189,6 +251,7 @@ async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
             tap,
             seccomp,
             jail,
+            memory_limit_mb,
         } => {
             let mut s = state.lock().await;
             let vm_id = s.alloc_id();
@@ -226,6 +289,9 @@ async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
                 Some(cid),
             ) {
                 Ok(pid) => {
+                    // Optional: create cgroup for memory isolation.
+                    let cgroup_path = setup_cgroup(&vm_id, pid, memory_limit_mb);
+
                     let record = VmRecord {
                         vm_id: vm_id.clone(),
                         pid,
@@ -238,6 +304,8 @@ async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
                             mem_mb,
                             vcpus,
                         },
+                        cgroup_path,
+                        memory_limit_mb,
                     };
                     s.vms.insert(vm_id.clone(), record);
 
@@ -246,6 +314,9 @@ async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
                     s.events.log(VmEvent::Boot {
                         vm_id: vm_id.clone(),
                     });
+
+                    // Update Prometheus gauges.
+                    crate::control::prometheus_metrics::set_vm_count(s.vms.len() as i64);
 
                     tracing::info!(vm_id = %vm_id, pid = pid, "VM created");
                     Response::Ok {
@@ -272,6 +343,15 @@ async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
                 s.events.log(VmEvent::Shutdown {
                     vm_id: vm_id.clone(),
                 });
+                crate::control::prometheus_metrics::remove_vm_memory(&vm_id);
+                crate::control::prometheus_metrics::set_vm_count(s.vms.len() as i64);
+
+                // Best-effort cgroup cleanup.
+                #[cfg(target_os = "linux")]
+                if let Err(e) = crate::control::cgroup::remove_cgroup(&vm_id) {
+                    tracing::warn!(vm_id = %vm_id, error = %e, "cgroup cleanup failed");
+                }
+
                 tracing::info!(vm_id = %vm_id, pid = record.pid, "VM destroyed");
                 Response::Ok {
                     body: ResponseBody::Ack {},
@@ -353,7 +433,7 @@ async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
             }
         }
 
-        Request::ForkVm { template_path, net, shared_dir, mem_mb, vcpus, overlay_size } => {
+        Request::ForkVm { template_path, net, shared_dir, mem_mb, vcpus, overlay_size, memory_limit_mb } => {
             let mut s = state.lock().await;
             let vm_id = s.alloc_id();
             let cid = s.next_cid;
@@ -376,6 +456,7 @@ async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
                 overlay_size.as_deref(),
             ) {
                 Ok(pid) => {
+                    let cgroup_path = setup_cgroup(&vm_id, pid, memory_limit_mb);
                     let record = VmRecord {
                         vm_id: vm_id.clone(),
                         pid,
@@ -388,6 +469,8 @@ async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
                             mem_mb: 0,
                             vcpus: 0,
                         },
+                        cgroup_path,
+                        memory_limit_mb,
                     };
                     s.vms.insert(vm_id.clone(), record);
                     s.metrics.update(&vm_id, VmMetrics::default());
@@ -395,6 +478,7 @@ async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
                         vm_id: vm_id.clone(),
                         template: template_path,
                     });
+                    crate::control::prometheus_metrics::set_vm_count(s.vms.len() as i64);
 
                     Response::Ok {
                         body: ResponseBody::VmCreated { vm_id, pid },
@@ -430,10 +514,58 @@ async fn dispatch(req: Request, state: &Arc<Mutex<ServerState>>) -> Response {
             }
         }
 
+        Request::RestoreVm { snapshot_path, net, shared_dir, block, memory_limit_mb } => {
+            let mut s = state.lock().await;
+            let vm_id = s.alloc_id();
+            let cid = s.next_cid;
+            s.next_cid += 1;
+
+            tracing::info!(
+                vm_id = %vm_id,
+                snapshot = %snapshot_path,
+                cid,
+                "Restoring VM from snapshot"
+            );
+
+            match daemon::spawn_restore(&snapshot_path, net, shared_dir.as_deref(), block.as_deref()) {
+                Ok(pid) => {
+                    let cgroup_path = setup_cgroup(&vm_id, pid, memory_limit_mb);
+                    let record = VmRecord {
+                        vm_id: vm_id.clone(),
+                        pid,
+                        state: VmState::Running,
+                        boot_time: Instant::now(),
+                        config: VmRecordConfig {
+                            kernel: String::new(),
+                            initrd: None,
+                            cmdline: String::new(),
+                            mem_mb: 0,
+                            vcpus: 0,
+                        },
+                        cgroup_path,
+                        memory_limit_mb,
+                    };
+                    s.vms.insert(vm_id.clone(), record);
+                    s.metrics.update(&vm_id, VmMetrics::default());
+                    s.events.log(VmEvent::Boot {
+                        vm_id: vm_id.clone(),
+                    });
+                    crate::control::prometheus_metrics::set_vm_count(s.vms.len() as i64);
+
+                    Response::Ok {
+                        body: ResponseBody::VmCreated { vm_id, pid },
+                    }
+                }
+                Err(e) => Response::Error {
+                    message: format!("Restore failed: {e}"),
+                },
+            }
+        }
+
         // Pause/Resume/Shutdown are handled by the per-VM sync_server,
         // not the async control server.
-        Request::Pause | Request::Resume | Request::Shutdown | Request::IncrementalSnapshot { .. } | Request::LiveMigrate { .. } | Request::Exec { .. } | Request::SetBalloon { .. } => Response::Error {
-            message: "Use the per-VM control socket for pause/resume/shutdown/incremental-snapshot/live-migrate/exec/set-balloon".to_string(),
+        Request::Pause | Request::Resume | Request::Shutdown | Request::IncrementalSnapshot { .. } | Request::LiveMigrate { .. } | Request::Exec { .. } | Request::SetBalloon { .. } | Request::Branch { .. } => Response::Error {
+            message: "Use the per-VM control socket for pause/resume/shutdown/incremental-snapshot/live-migrate/exec/set-balloon/branch".to_string(),
         },
     }
 }

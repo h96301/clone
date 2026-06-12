@@ -257,6 +257,62 @@ impl Serial {
         Arc::clone(&self.console_fd)
     }
 
+    /// Serialize serial device state for snapshot.
+    pub fn snapshot_state(&self) -> Vec<u8> {
+        serde_json::json!({
+            "data": self.data,
+            "ier": self.ier,
+            "iir": self.iir,
+            "lcr": self.lcr,
+            "mcr": self.mcr,
+            "lsr": self.lsr,
+            "msr": self.msr,
+            "scr": self.scr,
+            "dlab": self.dlab,
+            "divisor_low": self.divisor_low,
+            "divisor_high": self.divisor_high,
+            "input_buffer": self.input_buffer.iter().collect::<Vec<_>>(),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Restore serial device state from snapshot data.
+    pub fn restore_state(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let Ok(state) = serde_json::from_slice::<serde_json::Value>(data) else {
+            return;
+        };
+        let get = |key: &str| state.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        let get_bool = |key: &str| state.get(key).and_then(|v| v.as_bool()).unwrap_or(false);
+
+        self.data = get("data");
+        self.ier = get("ier");
+        self.iir = get("iir");
+        self.lcr = get("lcr");
+        self.mcr = get("mcr");
+        self.lsr = get("lsr");
+        self.msr = get("msr");
+        self.scr = get("scr");
+        self.dlab = get_bool("dlab");
+        self.divisor_low = get("divisor_low");
+        self.divisor_high = get("divisor_high");
+        self.input_buffer = state
+            .get("input_buffer")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|u| u as u8))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // output_buffer: start fresh (restore output is meaningless)
+        self.output_buffer.clear();
+        // console_fd: preserved as-is (host-side socket is new after restore)
+    }
+
     /// Flush any buffered output to stdout.
     pub fn flush_output(&mut self) {
         if !self.output_buffer.is_empty() {
