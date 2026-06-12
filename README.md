@@ -143,6 +143,16 @@ sudo clone run --kernel vmlinuz --rootfs alpine.img \
 # With overlay (shared read-only base, per-VM writable layer)
 sudo clone run --kernel vmlinuz --rootfs base.img --overlay
 
+# With persistent overlay (auto-created, survives restarts)
+clone run --kernel vmlinuz --rootfs ubuntu.img --overlay --overlay-size 10G --net --mem-mb 1024
+
+# Save and restore VM (in-memory processes survive)
+clone save --vm-id $VM_ID --output ./snapshots/my-vm
+clone restore --snapshot ./snapshots/my-vm --net
+
+# Start daemon with HTTP API and Prometheus metrics
+clone daemon --listen 127.0.0.1:8080 --auth-token secret123
+
 # GPU passthrough
 sudo clone run --kernel vmlinuz --rootfs ml.img \
   --passthrough 0000:01:00.0 --mem-mb 8192
@@ -179,13 +189,15 @@ sudo clone fork --template /tmp/my-template \
 | `clone run` | Boot a new VM from kernel + rootfs/initrd |
 | `clone fork` | Fork from a template snapshot (<20ms) |
 | `clone snapshot` | Snapshot a running VM for later fork |
+| `clone save` | Save a running VM to disk (memory + vCPU + device state), then shut down |
+| `clone restore` | Restore a saved VM from snapshot, in-memory processes resume |
 | `clone attach` | Attach to a running VM's serial console |
 | `clone exec` | Execute a command inside a running VM |
 | `clone list` | List running VMs (works with or without daemon) |
 | `clone migrate --live` | Pre-copy live migration to another host |
 | `clone migrate-recv` | Receive a live migration |
 | `clone rootfs create` | Create a bootable rootfs (Alpine, Ubuntu, Debian, Docker import) |
-| `clone daemon` | Multi-VM orchestration daemon (create, fork, snapshot, destroy) |
+| `clone daemon` | Multi-VM orchestration daemon with HTTP REST API and Unix socket |
 
 ### Devices
 
@@ -196,6 +208,52 @@ sudo clone fork --template /tmp/my-template \
 - **virtio-fs** — host directory sharing via inline FUSE (no external daemon)
 - **PCI bus** — ECAM config space for VFIO device passthrough
 - **Serial console** — 16550A UART, bidirectional terminal I/O
+
+### VM Save/Restore
+
+Pause a running VM, persist its full state (memory + vCPU registers + device state) to disk, then shut down. Restore later — in-memory processes pick up where they left off.
+
+```bash
+# Save a running VM
+clone save --vm-id $VM_ID --output ./snapshots/my-vm
+
+# Restore (network and overlay disk automatically reattached)
+clone restore --snapshot ./snapshots/my-vm --net
+```
+
+Overlay path and guest IP are saved alongside the snapshot, so `restore` reattaches the same disk and restores network connectivity automatically.
+
+### HTTP REST API
+
+The daemon exposes an HTTP API alongside the Unix socket, with optional Bearer token authentication and CORS support.
+
+```bash
+# Start daemon with HTTP
+clone daemon --listen 127.0.0.1:8080 --auth-token mysecret
+
+# API endpoints
+GET    /api/vms              List running VMs
+POST   /api/vms              Create a new VM
+GET    /api/vms/:id          Get VM status
+POST   /api/vms/:id/fork     Fork a VM
+POST   /api/vms/:id/snapshot Snapshot a VM
+DELETE /api/vms/:id          Destroy a VM
+GET    /metrics              Prometheus metrics
+```
+
+### Resource Isolation
+
+- **cgroup v2** — per-VM memory limits via `/sys/fs/cgroup/clone/{vm_id}/`, set with `--memory-limit-mb` on create
+- **Network namespaces** — per-VM netns isolation for stronger network separation between tenants
+- **Linux capabilities** — run without sudo using `CAP_NET_ADMIN` + `CAP_NET_RAW` (one-time `setcap`)
+
+### Prometheus Metrics
+
+Built-in metrics at `GET /metrics` in standard Prometheus exposition format: VM count, per-VM memory usage, fork/snapshot durations, HTTP request counters.
+
+### MCP Integration
+
+`sdk/clone-mcp/` provides a Model Context Protocol server that bridges AI agents (Claude Desktop, Cursor, etc.) to the clone daemon's HTTP API. Enables natural-language VM management through AI tools.
 
 ### Memory Management
 
@@ -275,14 +333,23 @@ src/
 ├── pci/                 PCI bus (ECAM), VFIO passthrough
 ├── migration/           Pre-copy live migration (sender, receiver, wire protocol)
 ├── control/             Control plane (per-VM socket + daemon for multi-VM orchestration)
+│   ├── http.rs          HTTP REST API (axum)
+│   ├── cgroup.rs        cgroup v2 per-VM memory limits
+│   ├── prometheus_metrics.rs  Prometheus metrics
+│   └── ...
 ├── net/                 TAP/bridge/NAT auto-setup
+│   ├── netns.rs         Network namespace isolation
+│   └── ...
 ├── storage/             Raw + QCOW2 block backends
 ├── rootfs.rs            Auto-generated initrd for --rootfs mode (embeds kernel modules, agent)
 └── rootfs_create.rs     `clone rootfs create` (Alpine, Ubuntu, Debian, Docker)
 
 crates/
 ├── guest-agent/         In-guest vsock agent (exec, networking, D-Bus recovery, heartbeat)
-└── clone-init/         Minimal init for auto-generated initrd (module loading, rootfs mount, agent launch)
+└── clone-init/          Minimal init for auto-generated initrd (module loading, rootfs mount, agent launch)
+
+sdk/
+└── clone-mcp/           MCP server for AI agent integration (Python)
 
 shell-template/
 ├── build.sh             Build Ubuntu 24.04 rootfs with 200+ dev tools
@@ -291,7 +358,7 @@ shell-template/
 └── setup-backups.sh     Nightly R2 backups for user home dirs
 ```
 
-**Dependencies:** kvm-ioctls, kvm-bindings, vm-memory, libc, clap, anyhow, tracing, sha2. No libvirt, no QEMU, no forked codebases.
+**Dependencies:** kvm-ioctls, kvm-bindings, vm-memory, libc, clap, anyhow, tracing, sha2, axum, prometheus. No libvirt, no QEMU, no forked codebases.
 
 ---
 
@@ -445,7 +512,7 @@ Clone exposes this via CLI (`clone fork`, `clone run`) and Unix socket API. Your
 
 **25K lines of Rust. 63 e2e tests (62 pass, 1 skip). Single binary.**
 
-Working: full VM boot (up to 64GB RAM), 5 virtio devices, PCI/VFIO passthrough, Shadow Clone fork (~160ms with networking and exec), live migration (1ms downtime), snapshots (full + incremental), memory overcommit + KSM + balloon, split memory regions (MMIO hole handling for >3GB VMs), virtio-fs, overlay mode (tmpfs + block), rootfs creation (Alpine, Ubuntu, Debian, Docker import), compressed kernel module support (.ko.zst, .ko.xz), seccomp, measured boot, multi-vCPU SMP, guest agent with remote exec (50ms response), guest networking (auto bridge/TAP/NAT/DNS), userspace vsock (fork-compatible), userspace virtio-net on fork path (ioeventfd + TAP poll), per-VM identity injection (hostname, CID, IP, MAC), D-Bus/service recovery after fork, daemon orchestration (create/fork/snapshot/destroy), console attach, daemonless VM listing.
+Working: full VM boot (up to 64GB RAM), 5 virtio devices, PCI/VFIO passthrough, Shadow Clone fork (~160ms with networking and exec), live migration (1ms downtime), snapshots (full + incremental), VM save/restore (in-memory processes survive), memory overcommit + KSM + balloon, split memory regions (MMIO hole handling for >3GB VMs), virtio-fs, overlay mode (tmpfs + block, auto persistent overlay with `--overlay-size`), rootfs creation (Alpine, Ubuntu, Debian, Docker import), compressed kernel module support (.ko.zst, .ko.xz), seccomp, measured boot, multi-vCPU SMP, guest agent with remote exec (50ms response), guest networking (auto bridge/TAP/NAT/DNS with bridge clone-br0), userspace vsock (fork-compatible), userspace virtio-net on fork path (ioeventfd + TAP poll), per-VM identity injection (hostname, CID, IP, MAC), D-Bus/service recovery after fork, daemon orchestration (create/fork/snapshot/destroy) with HTTP REST API + Prometheus metrics, cgroup v2 per-VM memory limits, network namespace isolation, Linux capabilities (sudo-less operation), SSH login optimization (UseDNS no), console attach, daemonless VM listing, MCP server for AI agent integration.
 
 Needs work: MSI-X interrupt routing (stubbed), SR-IOV, vGPU/mdev, confidential VMs (TDX/SEV), persistent disk overlay (qcow2 per-fork).
 
