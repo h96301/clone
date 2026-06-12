@@ -62,11 +62,13 @@ Three-layer memory management (overcommit + KSM + balloon), virtio-fs for host d
 The original shared hosting model — many users, each with their own Linux shell — but with VM-level hardware isolation instead of chroot.
 
 ```bash
-# Build the template image (Ubuntu 24.04 + 200+ dev tools)
-sudo ./shell-template/build.sh
+# Create a rootfs with dev tools
+sudo clone rootfs create --distro ubuntu --size 4G -o shell-base.img
 
-# Boot, warm binaries, snapshot
-sudo ./shell-template/warm.sh
+# Boot, install tools, then snapshot as template
+sudo clone run --kernel vmlinuz --rootfs shell-base.img --net --overlay
+# (install tools inside VM, then snapshot)
+clone snapshot --vm-id $VM_ID --output /templates/shell-base
 
 # Fork shells for users in ~160ms each
 clone fork --template /templates/shell-base --net
@@ -92,19 +94,32 @@ clone exec --vm-id $VM_ID -- curl https://example.com
 Shadow Clone fork from warm templates with the runtime already loaded. Sub-20ms cold start without custom kernel tuning.
 
 ```bash
-# Warm template with Python + ML libs loaded
-clone fork --template /templates/python-ml
+# 1. Create a rootfs with your runtime pre-installed
+sudo clone rootfs create --distro ubuntu --size 2G -o python-ml.img
+# Install Python + ML libs inside the image, then:
+
+# 2. Boot it, let the runtime warm up, snapshot as template
+sudo clone run --kernel vmlinuz --rootfs python-ml.img --net
+clone snapshot --vm-id $VM_ID --output /templates/python-ml
+
+# 3. Fork from template — runtime is already warm, no cold start
+clone fork --template /templates/python-ml --net
 # Execute function, destroy. Runtime was already warm.
 ```
 
 ### Dev Environments
 
-Isolated Linux environment in <20ms with your code mounted in.
+Isolated Linux environment with your code mounted in via virtio-fs.
 
 ```bash
-clone fork --template /templates/node20-warm \
-  --shared-dir ~/projects/myapp:code
-# Node.js already warm, your files at /mnt/code inside the VM
+# 1. Create a dev rootfs with Node.js (or any runtime) installed
+sudo clone rootfs create --distro ubuntu --size 2G -o node20.img
+
+# 2. Boot and mount your project directory into the guest
+clone run --kernel vmlinuz --rootfs node20.img --net \
+  --shared-dir ~/projects/myapp:code:/mnt/code \
+  --overlay --mem-mb 1024
+# Your files at /mnt/code inside the VM, overlay keeps changes ephemeral
 ```
 
 ### CI/CD Runners
@@ -351,11 +366,8 @@ crates/
 sdk/
 └── clone-mcp/           MCP server for AI agent integration (Python)
 
-shell-template/
-├── build.sh             Build Ubuntu 24.04 rootfs with 200+ dev tools
-├── warm.sh              Boot template, warm binaries, snapshot for fork
-├── setup-host.sh        Configure host (KVM, bridge, firewall, RAID)
-└── setup-backups.sh     Nightly R2 backups for user home dirs
+scripts/
+└── make_initrd.sh       Build custom initrd
 ```
 
 **Dependencies:** kvm-ioctls, kvm-bindings, vm-memory, libc, clap, anyhow, tracing, sha2, axum, prometheus. No libvirt, no QEMU, no forked codebases.
