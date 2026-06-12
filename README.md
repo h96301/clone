@@ -2,23 +2,164 @@
 
 A lightweight Linux VMM built for multi-tenant shell hosting and high-density VM workloads. 25K lines of Rust, single binary, KVM-based.
 
-Clone boots a template VM once, then forks isolated copies via Shadow Clone page mapping. Idle VMs get reclaimed automatically. A host running 100 shells uses memory like it's running 10.
+Fork of [unixshells/clone](https://github.com/nickelpack/clone) with significant enhancements.
 
-[![Watch the demo](demo.png)](https://www.youtube.com/watch?v=iWo9I2bjZkI)
-*[unixshells.com](https://unixshells.com) uses Clone as the VMM behind its shell hosting.*
+**[中文文档](README_CN.md)**
 
+---
+
+## What's New
+
+Enhancements on top of the original Clone:
+
+### Bridge Networking + Auto IP Allocation
+
+All VMs share a `clone-br0` bridge (172.30.0.0/16 subnet). IPs are allocated sequentially (172.30.0.2, 0.3, ...) — supports up to 65534 VMs. Uses `ioctl` instead of `ip` subprocess for bridge creation and IP configuration; NAT still uses iptables.
+
+```bash
+clone run --kernel vmlinuz --rootfs ubuntu.img --net
+# VM automatically gets 172.30.0.2, gateway, DNS — all configured
 ```
-Template VM (4GB Ubuntu, all tools warm)
-  ├── Fork → User shell 1  ─── ~160ms, full networking, unique IP
-  ├── Fork → User shell 2  ─── ~160ms, Shadow Clone diverges on write
-  ├── Fork → User shell 3  ─── ~160ms, balloon reclaims when idle
-  └── Fork → User shell N  ─── ~160ms, KVM hardware isolation
 
-Lightweight template (Alpine/busybox, 128-512MB)
-  ├── Fork → Lambda 1  ─── <20ms, minimal overhead
-  ├── Fork → Lambda 2  ─── <20ms, ~4MB per fork
-  └── Fork → Lambda N  ─── <20ms, destroy after use
+### Sudo-less Operation
+
+Linux capabilities (`CAP_NET_ADMIN`, `CAP_NET_RAW`) replace `sudo`. One-time setup after build:
+
+```bash
+sudo setcap cap_net_admin,cap_net_raw+ep target/release/clone
+# All subsequent operations without root
 ```
+
+### Auto Persistent Overlay
+
+`--overlay` automatically creates an overlay file named by IP (e.g. `overlay-172.30.0.2.img`). Uses `fallocate` (not sparse files) to avoid block device stalls. Supports `--overlay-size` parameter.
+
+```bash
+clone run --kernel vmlinuz --rootfs ubuntu.img --overlay --overlay-size 10G --net
+```
+
+### Directory Mounting (virtio-fs)
+
+`--shared-dir` supports three-segment format `path:tag:mountpoint` — auto-mounts to the specified guest path. `virtiofs.ko` is embedded into initrd, loaded and mounted by `clone-init` automatically.
+
+```bash
+clone run --kernel vmlinuz --rootfs ubuntu.img --net \
+  --shared-dir /host/path:tag:/guest/mount
+```
+
+### VM Save/Restore
+
+Save a running VM's full state (memory + vCPU + devices) to disk. Restore later — in-memory processes continue running.
+
+```bash
+clone save --vm-id $VM_ID --output ./snapshots/my-vm
+clone restore --snapshot ./snapshots/my-vm --net
+```
+
+Overlay path and guest IP are saved alongside the snapshot, so `restore` reattaches disk and network automatically.
+
+### HTTP REST API + Prometheus Metrics
+
+Daemon exposes an HTTP API with optional Bearer token auth and CORS. Built-in Prometheus metrics at `/metrics`.
+
+```bash
+clone daemon --listen 127.0.0.1:8080 --auth-token mysecret
+
+# Endpoints:
+GET    /api/vms              List running VMs
+POST   /api/vms              Create a new VM
+GET    /api/vms/:id          Get VM status
+POST   /api/vms/:id/fork     Fork a VM
+POST   /api/vms/:id/snapshot Snapshot a VM
+DELETE /api/vms/:id          Destroy a VM
+GET    /metrics              Prometheus metrics
+```
+
+### cgroup v2 + Network Namespace
+
+Per-VM cgroup memory limits (`--memory-limit-mb` on create). Per-VM network namespace isolation for stronger tenant separation.
+
+### Guest Auto Networking
+
+`clone-init` reads kernel parameters (`clone.net_ip/gw/mask`), configures `eth0` via `ioctl`, writes DNS (8.8.8.8), and adds default route — all automatic, no manual guest setup needed.
+
+### SSH Login Optimization
+
+`clone-init` auto-sets `UseDNS no` in `sshd_config`, eliminating DNS reverse lookup delay. Login drops from seconds to ~0.1s.
+
+### Stability Fixes
+
+- `fallocate` pre-allocation replaces sparse files — eliminates `blk_mq_requeue_work` CPU stalls
+- Kernel parameter `blk_mq=0` disables problematic block multi-queue
+- `clone-init` must be statically compiled (`RUSTFLAGS="-C target-feature=+crt-static"`)
+
+### MCP Integration
+
+`sdk/clone-mcp/` provides a Model Context Protocol server that bridges AI agents (Claude Desktop, Cursor, etc.) to the clone daemon's HTTP API.
+
+### Build Scripts
+
+- `build-alpine-image.sh` / `build-ubuntu-image.sh` / `build-ubuntu26-image.sh` — build rootfs images
+- `merge-image.sh` — merge overlay back into base image
+- `diagnose.sh` — VM diagnostics
+
+---
+
+## Quick Start
+
+```bash
+# Build
+cargo build --release
+
+# One-time: set capabilities for sudo-less operation
+sudo setcap cap_net_admin,cap_net_raw+ep target/release/clone
+
+# Create a rootfs
+sudo clone rootfs create --distro ubuntu --size 2G -o ubuntu.img
+
+# Boot a VM with networking + persistent overlay
+clone run --kernel vmlinuz --rootfs ubuntu.img --overlay --overlay-size 10G --net --mem-mb 1024
+
+# With host directory sharing
+clone run --kernel vmlinuz --rootfs ubuntu.img --net \
+  --shared-dir /host/path:tag:/guest/mount
+
+# Save and restore VM
+clone save --vm-id $VM_ID --output ./snapshots/my-vm
+clone restore --snapshot ./snapshots/my-vm --net
+
+# Start daemon with HTTP API
+clone daemon --listen 127.0.0.1:8080 --auth-token secret123
+```
+
+### Prerequisites
+
+- Linux host with KVM (`/dev/kvm`)
+- Kernel 6.5+ recommended
+- For networking: `/dev/net/tun` (vhost-net optional)
+
+---
+
+## VM Lifecycle
+
+| Command | What it does |
+|---------|-------------|
+| `clone run` | Boot a new VM from kernel + rootfs/initrd |
+| `clone fork` | Fork from a template snapshot (<20ms) |
+| `clone snapshot` | Snapshot a running VM for later fork |
+| `clone save` | Save a running VM to disk, then shut down |
+| `clone restore` | Restore a saved VM, in-memory processes resume |
+| `clone attach` | Attach to a running VM's serial console |
+| `clone exec` | Execute a command inside a running VM |
+| `clone list` | List running VMs |
+| `clone migrate --live` | Pre-copy live migration to another host |
+| `clone migrate-recv` | Receive a live migration |
+| `clone rootfs create` | Create a bootable rootfs (Alpine, Ubuntu, Debian, Docker import) |
+| `clone daemon` | Multi-VM orchestration daemon with HTTP REST API |
+
+---
+
+*Everything below is from the original project documentation.*
 
 ---
 
@@ -32,7 +173,18 @@ So we built Clone.
 
 **Clone's answer:** Shadow Clone fork from warm templates. Boot a VM once with everything loaded, snapshot it, then fork copies in <20ms. All forks share the same physical memory pages until they write — only dirty pages cost memory. 100 forked VMs use memory like 10. You get the resource profile of shared shell hosting with the full security of KVM hardware isolation.
 
-Three-layer memory management (overcommit + KSM + balloon), virtio-fs for host directory sharing, pre-copy live migration, and VFIO device passthrough — all in a single binary smaller than most config files.
+```
+Template VM (4GB Ubuntu, all tools warm)
+  ├── Fork → User shell 1  ─── ~160ms, full networking, unique IP
+  ├── Fork → User shell 2  ─── ~160ms, Shadow Clone diverges on write
+  ├── Fork → User shell 3  ─── ~160ms, balloon reclaims when idle
+  └── Fork → User shell N  ─── ~160ms, KVM hardware isolation
+
+Lightweight template (Alpine/busybox, 128-512MB)
+  ├── Fork → Lambda 1  ─── <20ms, minimal overhead
+  ├── Fork → Lambda 2  ─── <20ms, ~4MB per fork
+  └── Fork → Lambda N  ─── <20ms, destroy after use
+```
 
 | | Clone (measured) | Firecracker (official) | Cloud Hypervisor (official) | QEMU |
 |---|--------|-------------|------------------|------|
@@ -55,220 +207,7 @@ Three-layer memory management (overcommit + KSM + balloon), virtio-fs for host d
 
 ---
 
-## Use Cases
-
-### Unix Shell Hosting (Primary)
-
-The original shared hosting model — many users, each with their own Linux shell — but with VM-level hardware isolation instead of chroot.
-
-```bash
-# Create a rootfs with dev tools
-sudo clone rootfs create --distro ubuntu --size 4G -o shell-base.img
-
-# Boot, install tools, then snapshot as template
-sudo clone run --kernel vmlinuz --rootfs shell-base.img --net --overlay
-# (install tools inside VM, then snapshot)
-clone snapshot --vm-id $VM_ID --output /templates/shell-base
-
-# Fork shells for users in ~160ms each
-clone fork --template /templates/shell-base --net
-clone fork --template /templates/shell-base --net
-clone fork --template /templates/shell-base --net
-# All share the same base memory pages. KVM isolates each user.
-
-# Execute commands inside a forked VM
-clone exec --vm-id $VM_ID -- python3 -c "print('hello')"
-clone exec --vm-id $VM_ID -- curl https://example.com
-```
-
-- **~160ms** to spin up a new user shell (4GB Ubuntu, all tools warm)
-- **~500MB additional RAM** per forked 4GB VM (Shadow Clone sharing, measured: 2 VMs = 1GB host RAM)
-- **Full networking** — each fork gets TAP + bridge + NAT, ping/curl/HTTPS work
-- **Userspace vsock** — guest agent for exec, heartbeat, shutdown
-- **KVM hardware boundary** — not a container, real isolation
-- **Balloon reclaim** — idle shells automatically give back memory
-- **D-Bus/service recovery** — agent restarts stale services after fork
-
-### Function-as-a-Service
-
-Shadow Clone fork from warm templates with the runtime already loaded. Sub-20ms cold start without custom kernel tuning.
-
-```bash
-# 1. Create a rootfs with your runtime pre-installed
-sudo clone rootfs create --distro ubuntu --size 2G -o python-ml.img
-# Install Python + ML libs inside the image, then:
-
-# 2. Boot it, let the runtime warm up, snapshot as template
-sudo clone run --kernel vmlinuz --rootfs python-ml.img --net
-clone snapshot --vm-id $VM_ID --output /templates/python-ml
-
-# 3. Fork from template — runtime is already warm, no cold start
-clone fork --template /templates/python-ml --net
-# Execute function, destroy. Runtime was already warm.
-```
-
-### Dev Environments
-
-Isolated Linux environment with your code mounted in via virtio-fs.
-
-```bash
-# 1. Create a dev rootfs with Node.js (or any runtime) installed
-sudo clone rootfs create --distro ubuntu --size 2G -o node20.img
-
-# 2. Boot and mount your project directory into the guest
-clone run --kernel vmlinuz --rootfs node20.img --net \
-  --shared-dir ~/projects/myapp:code:/mnt/code \
-  --overlay --mem-mb 1024
-# Your files at /mnt/code inside the VM, overlay keeps changes ephemeral
-```
-
-### CI/CD Runners
-
-Shared base image, per-build writable overlay. Strong isolation, fast teardown.
-
-```bash
-sudo clone run --kernel vmlinuz --rootfs ubuntu-ci.img --overlay --net
-# Fresh writable layer on shared read-only base. Discard on exit.
-```
-
----
-
-## Quick Start
-
-```bash
-# Build
-cargo build --release
-
-# Create a rootfs (defaults: ubuntu=noble, debian=bookworm, alpine=3.21)
-sudo clone rootfs create --distro ubuntu --size 2G -o ubuntu.img
-sudo clone rootfs create --distro ubuntu --release jammy --size 2G -o ubuntu-22.img
-sudo clone rootfs create --distro alpine --size 1G -o alpine.img
-
-# Boot a VM
-sudo clone run --kernel /boot/vmlinuz-$(uname -r) --rootfs alpine.img
-
-# With networking
-sudo clone run --kernel vmlinuz --rootfs alpine.img --net --mem-mb 512
-
-# With host directory sharing
-sudo clone run --kernel vmlinuz --rootfs alpine.img \
-  --shared-dir /tmp/shared:myfs
-# Inside guest: mount -t virtiofs myfs /mnt
-
-# With overlay (shared read-only base, per-VM writable layer)
-sudo clone run --kernel vmlinuz --rootfs base.img --overlay
-
-# With persistent overlay (auto-created, survives restarts)
-clone run --kernel vmlinuz --rootfs ubuntu.img --overlay --overlay-size 10G --net --mem-mb 1024
-
-# Save and restore VM (in-memory processes survive)
-clone save --vm-id $VM_ID --output ./snapshots/my-vm
-clone restore --snapshot ./snapshots/my-vm --net
-
-# Start daemon with HTTP API and Prometheus metrics
-clone daemon --listen 127.0.0.1:8080 --auth-token secret123
-
-# GPU passthrough
-sudo clone run --kernel vmlinuz --rootfs ml.img \
-  --passthrough 0000:01:00.0 --mem-mb 8192
-
-# Attach to a running VM's serial console (Ctrl-Q to detach)
-clone attach
-
-# Execute a command inside a running VM
-clone exec -- ls /
-
-# List all running VMs (no daemon required)
-clone list --no-daemon
-
-# Fork with full device support
-sudo clone fork --template /tmp/my-template \
-  --net --shared-dir /tmp/shared:myfs --block extra-disk.img
-```
-
-### Prerequisites
-
-- Linux host with KVM (`/dev/kvm`)
-- Kernel 6.5+ recommended
-- For networking: `/dev/net/tun` (vhost-net optional, used on boot path only)
-- For GPU passthrough: device bound to `vfio-pci` driver
-
----
-
 ## Features
-
-### VM Lifecycle
-
-| Command | What it does |
-|---------|-------------|
-| `clone run` | Boot a new VM from kernel + rootfs/initrd |
-| `clone fork` | Fork from a template snapshot (<20ms) |
-| `clone snapshot` | Snapshot a running VM for later fork |
-| `clone save` | Save a running VM to disk (memory + vCPU + device state), then shut down |
-| `clone restore` | Restore a saved VM from snapshot, in-memory processes resume |
-| `clone attach` | Attach to a running VM's serial console |
-| `clone exec` | Execute a command inside a running VM |
-| `clone list` | List running VMs (works with or without daemon) |
-| `clone migrate --live` | Pre-copy live migration to another host |
-| `clone migrate-recv` | Receive a live migration |
-| `clone rootfs create` | Create a bootable rootfs (Alpine, Ubuntu, Debian, Docker import) |
-| `clone daemon` | Multi-VM orchestration daemon with HTTP REST API and Unix socket |
-
-### Devices
-
-- **virtio-block** — raw and qcow2 disk images, thin provisioning
-- **virtio-net** — TAP + vhost-net (boot) or userspace (fork), auto bridge/NAT setup
-- **virtio-balloon** — cooperative memory reclaim with hysteresis policy
-- **virtio-vsock** — userspace backend for host-guest communication (fork-compatible)
-- **virtio-fs** — host directory sharing via inline FUSE (no external daemon)
-- **PCI bus** — ECAM config space for VFIO device passthrough
-- **Serial console** — 16550A UART, bidirectional terminal I/O
-
-### VM Save/Restore
-
-Pause a running VM, persist its full state (memory + vCPU registers + device state) to disk, then shut down. Restore later — in-memory processes pick up where they left off.
-
-```bash
-# Save a running VM
-clone save --vm-id $VM_ID --output ./snapshots/my-vm
-
-# Restore (network and overlay disk automatically reattached)
-clone restore --snapshot ./snapshots/my-vm --net
-```
-
-Overlay path and guest IP are saved alongside the snapshot, so `restore` reattaches the same disk and restores network connectivity automatically.
-
-### HTTP REST API
-
-The daemon exposes an HTTP API alongside the Unix socket, with optional Bearer token authentication and CORS support.
-
-```bash
-# Start daemon with HTTP
-clone daemon --listen 127.0.0.1:8080 --auth-token mysecret
-
-# API endpoints
-GET    /api/vms              List running VMs
-POST   /api/vms              Create a new VM
-GET    /api/vms/:id          Get VM status
-POST   /api/vms/:id/fork     Fork a VM
-POST   /api/vms/:id/snapshot Snapshot a VM
-DELETE /api/vms/:id          Destroy a VM
-GET    /metrics              Prometheus metrics
-```
-
-### Resource Isolation
-
-- **cgroup v2** — per-VM memory limits via `/sys/fs/cgroup/clone/{vm_id}/`, set with `--memory-limit-mb` on create
-- **Network namespaces** — per-VM netns isolation for stronger network separation between tenants
-- **Linux capabilities** — run without sudo using `CAP_NET_ADMIN` + `CAP_NET_RAW` (one-time `setcap`)
-
-### Prometheus Metrics
-
-Built-in metrics at `GET /metrics` in standard Prometheus exposition format: VM count, per-VM memory usage, fork/snapshot durations, HTTP request counters.
-
-### MCP Integration
-
-`sdk/clone-mcp/` provides a Model Context Protocol server that bridges AI agents (Claude Desktop, Cursor, etc.) to the clone daemon's HTTP API. Enables natural-language VM management through AI tools.
 
 ### Memory Management
 
@@ -279,8 +218,6 @@ Three layers stacked to minimize host RAM across VMs:
 3. **Balloon** — graduated reclaim with hysteresis (idle 30s → 25%, idle 2min → 50%, idle 5min → floor)
 
 Result: 10 idle 512MB VMs use ~200MB of host RAM, not 5GB.
-
-VMs with >3GB RAM automatically get split memory regions around the x86 PCI MMIO hole (3-4GB). The guest sees all requested memory (e.g., 4GB VM → 3.8Gi usable, 8GB → 7.8Gi). No configuration needed — Clone handles the split transparently.
 
 ### Shadow Clone Fork
 
@@ -319,6 +256,16 @@ Source                              Destination
 - **Seccomp jailer** — BPF syscall filter on VMM process (`--seccomp`)
 - **Measured boot** — SHA-256 kernel hash verification before loading
 - **Namespace jail** — optional full jail with chroot + capabilities (`--jail`)
+
+### Devices
+
+- **virtio-block** — raw and qcow2 disk images, thin provisioning
+- **virtio-net** — TAP + vhost-net (boot) or userspace (fork), auto bridge/NAT setup
+- **virtio-balloon** — cooperative memory reclaim with hysteresis policy
+- **virtio-vsock** — userspace backend for host-guest communication (fork-compatible)
+- **virtio-fs** — host directory sharing via inline FUSE (no external daemon)
+- **PCI bus** — ECAM config space for VFIO device passthrough
+- **Serial console** — 16550A UART, bidirectional terminal I/O
 
 ### Rootfs Modes
 
@@ -388,12 +335,8 @@ All numbers measured on bare-metal (OVH dedicated server, Intel Xeon E-2386G, Ub
 | Incremental snapshot size | **192KB** for 512MB VM (682x smaller than full) |
 | Shadow Clone sharing (2x 4GB Ubuntu) | **~1GB host RAM** for 8GB committed |
 | Shadow Clone sharing (3x Alpine) | **13MB** vs 127MB template |
-| Fork networking | Full (ping, curl, HTTPS) via userspace virtio-net |
-| Fork exec | echo/python/git/curl all work within 50ms |
 | Binary size | ~3MB |
 | VMM memory overhead | ~5-10MB |
-
-See [docs/SPEC.md](docs/SPEC.md) for detailed comparisons with Firecracker, Cloud Hypervisor, and QEMU.
 
 ---
 
@@ -401,132 +344,19 @@ See [docs/SPEC.md](docs/SPEC.md) for detailed comparisons with Firecracker, Clou
 
 **63 tests, 62 passed, 1 skipped. Full suite in ~315 seconds.**
 
-Run on bare-metal Ubuntu 22.04, kernel 6.5.0-35-generic, 2026-03-17.
-
-### Boot & ACPI
-| Test | Result | Details |
-|------|--------|---------|
-| `test_boot_serial` | PASS | VM booted, printed serial marker, completed init |
-| `test_boot_speed` | PASS | Cold boot in **2,218ms** (< 3,000ms target) |
-| `test_boot_speed_avg` | PASS | Average **2,225ms** over 5 runs (< 3,000ms target) |
-| `test_acpi_no_errors` | PASS | Zero ACPI errors in boot log |
-| `test_multi_vcpu` | PASS | 4-vCPU VM booted, guest sees 4 CPUs |
-
-### Control Plane
-| Test | Result | Details |
-|------|--------|---------|
-| `test_control_socket` | PASS | Socket appears, status/pause/resume/shutdown all work |
-| `test_pause_resume` | PASS | VM survives 6 pause/resume cycles |
-
-### Storage
-| Test | Result | Details |
-|------|--------|---------|
-| `test_virtio_block_rw` | PASS | VM boots with virtio-block attached |
-| `test_qcow2_block` | PASS | QCOW2 disk image as block backend |
-| `test_qcow2_backing_file` | PASS | QCOW2 overlay + raw backing (overlay=196KB, base=16MB untouched) |
-
-### Snapshots & Fork
-| Test | Result | Details |
-|------|--------|---------|
-| `test_snapshot_fork` | PASS | Snapshot created, integrity verified, forked VM running |
-| `test_incremental_snapshot` | PASS | Incremental snapshot **668x smaller** (full=128MB, dirty=192KB) |
-| `test_shadow_clone_sharing` | PASS | 3 forked VMs RSS=**19MB** < 2x single VM=125MB |
-| `test_template_integrity` | PASS | Corrupted template correctly rejected |
-
-### Security
-| Test | Result | Details |
-|------|--------|---------|
-| `test_seccomp_filter` | PASS | VM boots and runs cleanly under seccomp BPF |
-
-### Devices & Sharing
-| Test | Result | Details |
-|------|--------|---------|
-| `test_virtiofs` | PASS | virtio-fs device registered and active |
-| `test_pci_bus` | PASS | VM boots with PCI enumeration active (no `pci=off`) |
-| `test_vfio_passthrough` | SKIP | No PCI device bound to vfio-pci on test server |
-
-### Migration
-| Test | Result | Details |
-|------|--------|---------|
-| `test_live_migration` | PASS | Pre-copy migration, **1ms downtime**, source stopped, receiver running |
-
-### Rootfs Boot (Real Distros)
-| Test | Result | Details |
-|------|--------|---------|
-| `test_rootfs_alpine` | PASS | Alpine 3.21 boots to OpenRC login prompt |
-| `test_rootfs_ubuntu` | PASS | Ubuntu 24.04 (noble) boots, clone-init hands off to init, control socket active |
-
-### Guest Agent & Networking
-| Test | Result | Details |
-|------|--------|---------|
-| `test_unique_cid` | PASS | 2 VMs with unique CIDs boot simultaneously |
-| `test_guest_networking` | PASS | eth0 configured, gateway ICMP, DNS (UDP), TCP all working |
-| `test_exec_latency` | PASS | Exec round-trip in **796ms** (< 1,000ms target) |
-
-### Multi-VM & Memory
-| Test | Result | Details |
-|------|--------|---------|
-| `test_concurrent_vms` | PASS | 3 VMs running simultaneously |
-| `test_memory_accounting` | PASS | 512MB VM uses **126MB RSS** (overcommit working) |
-| `test_balloon` | PASS | Guest kernel detects virtio-balloon, RSS=**126MB** for 512MB VM |
-
-### Shadow Clone with Real Distros
-| Test | Result | Details |
-|------|--------|---------|
-| `test_shadow_clone_rootfs` | PASS | Alpine template (126MB) → 3 forks total RSS=**18MB** (~6MB/fork) |
-
-```bash
-# Run all tests (requires root + KVM + kernel 6.5+)
-sudo KERNEL=/path/to/vmlinuz-6.5 ./tests/e2e/run_all.sh
-
-# Run a specific test
-sudo KERNEL=/path/to/vmlinuz-6.5 ./tests/e2e/run_all.sh test_live_migration
-```
-
----
-
-## Building on Clone
-
-Clone is the VM engine. Your product is what you build on top.
-
-**What Clone handles (the hard part):**
-- VM lifecycle — boot, fork, snapshot, migrate, shutdown
-- Memory efficiency — CoW sharing, overcommit, KSM, balloon reclaim
-- Device I/O — block, network, filesystem sharing, GPU passthrough
-- Isolation — KVM hardware boundary, seccomp, measured boot
-- Control plane — per-VM Unix socket API + daemon for multi-VM orchestration
-- Guest networking — auto bridge/TAP/NAT/DNS, per-VM IP allocation
-
-**What you build for your use case (the product):**
-
-| Use Case | You Build |
-|----------|-----------|
-| **Shell hosting** | User auth, SSH key injection, template management, quota/billing, web terminal (websocket → serial bridge) |
-| **FaaS platform** | HTTP router → fork → execute → respond → destroy, request queuing, template pool per runtime |
-| **CI/CD runners** | Job scheduler, build script injection, artifact extraction, GitHub/GitLab webhook integration |
-| **Dev environments** | Workspace config (which template, which dirs to mount), IDE integration, persistent overlay management |
-
-The pattern is always the same:
-
-```
-1. Create templates for your workload (boot once, snapshot)
-2. Fork VMs from templates on demand (<20ms)
-3. Inject per-user/per-request state (dirs, env, identity)
-4. Run workload
-5. Destroy or migrate when done
-```
-
-Clone exposes this via CLI (`clone fork`, `clone run`) and Unix socket API. Your orchestration layer calls these and adds the business logic.
-
----
-
-## Status
-
-**25K lines of Rust. 63 e2e tests (62 pass, 1 skip). Single binary.**
-
-Working: full VM boot (up to 64GB RAM), 5 virtio devices, PCI/VFIO passthrough, Shadow Clone fork (~160ms with networking and exec), live migration (1ms downtime), snapshots (full + incremental), VM save/restore (in-memory processes survive), memory overcommit + KSM + balloon, split memory regions (MMIO hole handling for >3GB VMs), virtio-fs, overlay mode (tmpfs + block, auto persistent overlay with `--overlay-size`), rootfs creation (Alpine, Ubuntu, Debian, Docker import), compressed kernel module support (.ko.zst, .ko.xz), seccomp, measured boot, multi-vCPU SMP, guest agent with remote exec (50ms response), guest networking (auto bridge/TAP/NAT/DNS with bridge clone-br0), userspace vsock (fork-compatible), userspace virtio-net on fork path (ioeventfd + TAP poll), per-VM identity injection (hostname, CID, IP, MAC), D-Bus/service recovery after fork, daemon orchestration (create/fork/snapshot/destroy) with HTTP REST API + Prometheus metrics, cgroup v2 per-VM memory limits, network namespace isolation, Linux capabilities (sudo-less operation), SSH login optimization (UseDNS no), console attach, daemonless VM listing, MCP server for AI agent integration.
-
-Needs work: MSI-X interrupt routing (stubbed), SR-IOV, vGPU/mdev, confidential VMs (TDX/SEV), persistent disk overlay (qcow2 per-fork).
+| Category | Tests | Highlights |
+|----------|-------|------------|
+| Boot & ACPI | 5 PASS | Cold boot **2,218ms**, 4-vCPU SMP |
+| Control Plane | 2 PASS | Socket status/pause/resume/shutdown |
+| Storage | 3 PASS | virtio-block, QCOW2, backing file overlay |
+| Snapshots & Fork | 4 PASS | Incremental **192KB**, Shadow Clone sharing **19MB RSS** |
+| Security | 1 PASS | Seccomp BPF |
+| Devices | 2 PASS, 1 SKIP | virtio-fs, PCI, VFIO (skip: no hardware) |
+| Migration | 1 PASS | **1ms downtime** |
+| Rootfs Boot | 2 PASS | Alpine 3.21, Ubuntu 24.04 |
+| Networking | 3 PASS | Unique CID, guest networking, exec **796ms** |
+| Multi-VM & Memory | 3 PASS | Concurrent VMs, overcommit, balloon |
+| Shadow Clone | 1 PASS | 3 forks **18MB total RSS** |
 
 ---
 
