@@ -335,7 +335,10 @@ impl Vm {
                 };
                 match tap_result {
                     Ok(tap_fd) => {
-                        let mac = crate::net::NetworkConfig::mac_from_id(1);
+                        // Derive MAC from CID so concurrent VMs get unique MACs.
+                        // Falls back to 1 if CID is unset (single-VM scenario).
+                        let mac_id = self.config.cid.unwrap_or(1) as u32;
+                        let mac = crate::net::NetworkConfig::mac_from_id(mac_id);
                         let mut net_dev = crate::virtio::net::VirtioNet::new(tap_fd, mac);
                         // Pre-compute IRQ and pass VM fd for vhost-net setup
                         let irq = crate::virtio::IRQ_BASE + mmio_bus.device_count() as u32;
@@ -630,7 +633,16 @@ impl Vm {
             if let Some(ip) = self.config.guest_ip {
                 identity.ip_address = ip;
             }
-            let cid = identity.vsock_cid as u64;
+            // Daemon-driven CID/MAC: when config.cid is set (fork via daemon),
+            // use it for vsock CID and MAC so concurrent VMs are consistent
+            // with cold run. Falls back to identity random values otherwise.
+            let cid = if let Some(c) = self.config.cid {
+                identity.vsock_cid = c;
+                identity.mac_address = crate::net::NetworkConfig::mac_from_id(c as u32);
+                c
+            } else {
+                identity.vsock_cid
+            };
             match VirtioVsock::new(cid) {
                 Ok(mut vsock) => {
                     let dev_idx = mmio_bus.device_count();
@@ -966,7 +978,16 @@ impl Vm {
             if let Some(ip) = self.config.guest_ip {
                 identity.ip_address = ip;
             }
-            let cid = identity.vsock_cid as u64;
+            // Daemon-driven CID/MAC: when config.cid is set (restore via daemon),
+            // use it for vsock CID and MAC so concurrent VMs are consistent
+            // with cold run. Falls back to identity random values otherwise.
+            let cid = if let Some(c) = self.config.cid {
+                identity.vsock_cid = c;
+                identity.mac_address = crate::net::NetworkConfig::mac_from_id(c as u32);
+                c
+            } else {
+                identity.vsock_cid
+            };
             match VirtioVsock::new(cid) {
                 Ok(mut vsock) => {
                     let dev_idx = mmio_bus.device_count();

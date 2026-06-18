@@ -53,6 +53,7 @@ members = [
     ".",
     "crates/guest-agent",
     "crates/clone-init",
+    "crates/clone-controller",
 ]
 
 [features]

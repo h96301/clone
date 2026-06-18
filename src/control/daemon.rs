@@ -151,6 +151,7 @@ pub fn spawn_restore(
     net: bool,
     shared_dir: Option<&str>,
     block: Option<&str>,
+    cid: Option<u64>,
 ) -> Result<u32> {
     let exe = std::env::current_exe()
         .unwrap_or_else(|_| std::path::PathBuf::from("clone"));
@@ -167,6 +168,9 @@ pub fn spawn_restore(
     }
     if let Some(b) = block {
         cmd.arg("--block").arg(b);
+    }
+    if let Some(c) = cid {
+        cmd.arg("--cid").arg(c.to_string());
     }
 
     cmd.stdin(std::process::Stdio::null());
@@ -354,11 +358,17 @@ pub async fn run_daemon(
     socket_path: &str,
     http_bind: Option<String>,
     auth_token: Option<String>,
+    state_file: Option<std::path::PathBuf>,
 ) -> Result<()> {
     eprintln!("Clone daemon listening on {socket_path}");
-    tracing::info!(socket = socket_path, http_bind = ?http_bind, "Daemon starting");
+    tracing::info!(
+        socket = socket_path,
+        http_bind = ?http_bind,
+        state_file = ?state_file,
+        "Daemon starting"
+    );
 
-    let server = crate::control::ControlServer::new(socket_path);
+    let server = crate::control::ControlServer::new(socket_path, state_file);
 
     // Start the child process monitor using the server's shared state.
     // The monitor checks if tracked VM processes are still alive and

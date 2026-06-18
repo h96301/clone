@@ -82,16 +82,92 @@ pub struct ServerState {
     next_cid: u64,
     metrics: MetricsCollector,
     events: EventLogger,
+    /// Optional JSON state file for persisting next_id/next_cid across restarts.
+    /// When set, load on construction and atomic-write on every allocation.
+    state_file: Option<std::path::PathBuf>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct PersistedState {
+    next_id: u64,
+    next_cid: u64,
 }
 
 impl ServerState {
-    fn new() -> Self {
-        Self {
+    fn new(state_file: Option<std::path::PathBuf>) -> Self {
+        let mut state = Self {
             vms: HashMap::new(),
             next_id: 1,
             next_cid: 3,
             metrics: MetricsCollector::new(),
             events: EventLogger::new(4096),
+            state_file: state_file.clone(),
+        };
+        if let Some(path) = state_file {
+            state.load_from_file(&path);
+        }
+        state
+    }
+
+    fn load_from_file(&mut self, path: &std::path::Path) {
+        match std::fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<PersistedState>(&bytes) {
+                Ok(p) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        next_id = p.next_id,
+                        next_cid = p.next_cid,
+                        "Loaded persisted daemon state"
+                    );
+                    self.next_id = p.next_id.max(1);
+                    // 保留 >= 3 的约束：VM 寄主机协议保留 cid 1/2。
+                    self.next_cid = p.next_cid.max(3);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to parse daemon state file, starting with defaults"
+                    );
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(
+                    path = %path.display(),
+                    "No existing daemon state file, starting fresh"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to read daemon state file, starting with defaults"
+                );
+            }
+        }
+    }
+
+    fn persist(&self) {
+        let Some(path) = self.state_file.as_ref() else { return; };
+        let payload = PersistedState {
+            next_id: self.next_id,
+            next_cid: self.next_cid,
+        };
+        let json = match serde_json::to_vec(&payload) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to serialize daemon state");
+                return;
+            }
+        };
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, &json) {
+            tracing::warn!(path = %tmp.display(), error = %e, "Failed to write daemon state tmp file");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            tracing::warn!(path = %path.display(), error = %e, "Failed to rename daemon state file");
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
@@ -114,10 +190,14 @@ pub struct ControlServer {
 
 impl ControlServer {
     /// Create a new control server bound to the given socket path.
-    pub fn new(socket_path: impl Into<String>) -> Self {
+    /// `state_file` 若提供，则用于持久化 next_id/next_cid（跨重启）。
+    pub fn new(
+        socket_path: impl Into<String>,
+        state_file: Option<std::path::PathBuf>,
+    ) -> Self {
         Self {
             socket_path: socket_path.into(),
-            state: Arc::new(Mutex::new(ServerState::new())),
+            state: Arc::new(Mutex::new(ServerState::new(state_file))),
         }
     }
 
@@ -257,6 +337,7 @@ async fn dispatch_inner(req: Request, state: &Arc<Mutex<ServerState>>) -> Respon
             let vm_id = s.alloc_id();
             let cid = s.next_cid;
             s.next_cid += 1;
+            s.persist();
             let vm_index = cid - 3; // 0-based index for IP derivation
 
             // Derive guest IP from CID; agent port is always the fixed base port.
@@ -438,6 +519,7 @@ async fn dispatch_inner(req: Request, state: &Arc<Mutex<ServerState>>) -> Respon
             let vm_id = s.alloc_id();
             let cid = s.next_cid;
             s.next_cid += 1;
+            s.persist();
 
             tracing::info!(
                 vm_id = %vm_id,
@@ -519,6 +601,7 @@ async fn dispatch_inner(req: Request, state: &Arc<Mutex<ServerState>>) -> Respon
             let vm_id = s.alloc_id();
             let cid = s.next_cid;
             s.next_cid += 1;
+            s.persist();
 
             tracing::info!(
                 vm_id = %vm_id,
@@ -527,7 +610,7 @@ async fn dispatch_inner(req: Request, state: &Arc<Mutex<ServerState>>) -> Respon
                 "Restoring VM from snapshot"
             );
 
-            match daemon::spawn_restore(&snapshot_path, net, shared_dir.as_deref(), block.as_deref()) {
+            match daemon::spawn_restore(&snapshot_path, net, shared_dir.as_deref(), block.as_deref(), Some(cid)) {
                 Ok(pid) => {
                     let cgroup_path = setup_cgroup(&vm_id, pid, memory_limit_mb);
                     let record = VmRecord {

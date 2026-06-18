@@ -2,3 +2,11 @@
 .DS_Store
 /backup
 backup/
+
+# 镜像文件（内核、rootfs、overlay）
+vmlinuz*
+*.img
+!**/assets/**/*.img
+
+# VM 快照
+vm-snapshots/

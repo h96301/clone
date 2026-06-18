@@ -233,6 +233,12 @@ enum Commands {
         /// Can also be set via CLONE_AUTH_TOKEN environment variable.
         #[arg(long, env = "CLONE_AUTH_TOKEN")]
         auth_token: Option<String>,
+
+        /// Path to JSON state file for persisting next_id/next_cid across
+        /// daemon restarts. Defaults to /tmp/clone-daemon-state.json when
+        /// omitted, set to empty path to disable.
+        #[arg(long, default_value = "/tmp/clone-daemon-state.json")]
+        state_file: String,
     },
     /// Create a new VM via the daemon
     Create {
@@ -361,6 +367,10 @@ enum Commands {
         /// Block device image (overrides snapshot metadata)
         #[arg(long)]
         block: Option<String>,
+        /// vsock CID for the restored VM. Required when running multiple VMs
+        /// concurrently to avoid vsock CID collisions.
+        #[arg(long)]
+        cid: Option<u64>,
     },
 }
 
@@ -877,9 +887,14 @@ fn main() -> Result<()> {
                 }
             }
         },
-        Commands::Daemon { socket, listen, auth_token } => {
+        Commands::Daemon { socket, listen, auth_token, state_file } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(control::daemon::run_daemon(&socket, listen, auth_token))?;
+            let state_path = if state_file.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(&state_file))
+            };
+            rt.block_on(control::daemon::run_daemon(&socket, listen, auth_token, state_path))?;
         }
         Commands::Create { socket, kernel, mem_mb, vcpus, initrd, rootfs, overlay, shared_dir, block, net, tap, seccomp, jail, memory_limit_mb } => {
             let rt = tokio::runtime::Runtime::new()?;
@@ -1171,7 +1186,7 @@ fn main() -> Result<()> {
 
             eprintln!("VM saved to {output}. Restore with: clone restore --snapshot {output} --net");
         }
-        Commands::Restore { snapshot, net, tap, shared_dir, block } => {
+        Commands::Restore { snapshot, net, tap, shared_dir, block, cid } => {
             #[cfg(target_os = "linux")]
             {
                 // Auto-configure networking if requested
@@ -1201,7 +1216,7 @@ fn main() -> Result<()> {
                     passthrough_devices: Vec::new(),
                     seccomp: false,
                     jail: None,
-                    cid: None,
+                    cid,
                     tap_fd: pre_opened_tap_fd,
                     guest_ip,
                 };

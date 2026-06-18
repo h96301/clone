@@ -322,8 +322,19 @@ fn main() {
         }
     }
 
-    // Find init to exec
-    let init_paths = ["/sbin/init", "/bin/init", "/lib/systemd/systemd", "/bin/sh"];
+    // Find init to exec.
+    // If the kernel cmdline contains clone.init=/path, exec that directly,
+    // bypassing /sbin/init (systemd/OpenRC). Used for serverless scenarios
+    // where the goal is to start a single user app as fast as possible.
+    let cmdline = read_cmdline();
+    let custom_init = parse_param(&cmdline, "clone.init").map(|s| s.to_string());
+    let init_paths: Vec<String> = if let Some(ref custom) = custom_init {
+        msg(&format!("[clone-init] custom init from cmdline: {custom}"));
+        vec![custom.clone()]
+    } else {
+        ["/sbin/init", "/bin/init", "/lib/systemd/systemd", "/bin/sh"]
+            .iter().map(|s| s.to_string()).collect()
+    };
     for init in &init_paths {
         if Path::new(init).exists() {
             msg(&format!("[clone-init] exec {init}"));
